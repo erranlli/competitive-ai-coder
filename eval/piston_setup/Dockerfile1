@@ -1,0 +1,21 @@
+# Start FROM the official image, which has all dependencies pre-installed
+FROM ghcr.io/engineer-man/piston
+
+# Set the working directory
+WORKDIR /piston_api
+
+# Copy our patched application and startup script into the image
+COPY ./index.js ./src/index.js
+COPY ./entrypoint.sh ./src/entrypoint.sh
+
+# Make our new startup script executable
+RUN chmod +x ./src/entrypoint.sh
+
+# --- NEW, CORRECTED SECTION: Pre-install language runtimes ---
+# Copy and run our custom Node.js installer script.
+COPY ./install_packages.js .
+RUN node install_packages.js
+# --- END OF NEW SECTION ---
+
+# Set our script as the command to run when the container starts
+CMD ["/piston_api/src/entrypoint.sh"]

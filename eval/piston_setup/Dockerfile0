@@ -1,0 +1,15 @@
+# Start FROM the official image, which contains all the slow-to-install dependencies
+FROM ghcr.io/engineer-man/piston
+
+# Set the working directory, which is a good practice
+WORKDIR /piston_api
+
+# Copy our patched application and startup script into the image
+COPY ./index.js ./src/index.js
+COPY ./entrypoint.sh ./src/entrypoint.sh
+
+# Make our new startup script executable
+RUN chmod +x ./src/entrypoint.sh
+
+# Set our script as the command to run when the container starts
+CMD ["/piston_api/src/entrypoint.sh"]
