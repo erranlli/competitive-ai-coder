@@ -416,7 +416,7 @@ def evaluate_records(
     endpoint: str,
     generated_tests_dir: str,
     max_generated_tests: int = 10,
-    results_dir: str = "/root/rllm/trav_test/results",
+    results_dir: str = "/root/competitive-coding-ai/results",
     stop_on_first_failure: bool = False,
     skip_large_inputs_over: int = -1,
     sort_generated_tests: str = "none",  # none | small_first | large_first
@@ -424,8 +424,11 @@ def evaluate_records(
     generated_tests_workers: int = 1,
     generated_tests_sample: float = 1.0,
 ) -> str:
-    ensure_dir(results_dir)
-    out_path = os.path.join(results_dir, "piston_eval_results.jsonl")
+    # Derive subdirectory from solutions file prefix (basename without extension)
+    solutions_prefix = os.path.splitext(os.path.basename(solutions_path))[0]
+    final_results_dir = os.path.join(results_dir, solutions_prefix)
+    ensure_dir(final_results_dir)
+    out_path = os.path.join(final_results_dir, "piston_eval_results.jsonl")
     with open(out_path, "w", encoding="utf-8"):
         pass
 
@@ -658,9 +661,17 @@ def evaluate_records(
             has_tests = len(official_tests) > 0 or len(gen_tests) > 0
             if all_passed and has_tests:
                 correct += 1
+                #print(f"""***problem:{problem_id} Correct, passed all tests""")
+                #for case in per_case:
+                #    print(f"""code:{item.get('code', '')}""")
+                #    print(f"""model output:{case.get('output', '')}, expected output:{case.get('expected', '')}""")
+                #    print(f"""problem:{problem_id}, test_case:{case.get('test_case_i', '')}, error:{case.get('error','')}, reason:{case.get('reason', '')}""")
+
             else:
                 for case in per_case:
                     if not case['passed']:
+                        print(f"""code:{item.get('code', '')}""")
+                        print(f"""model output:{case.get('output', '')}, expected output:{case.get('expected', '')}""")
                         print(f"""problem:{problem_id}, test_case:{case.get('test_case_i', '')}, error:{case.get('error','')}, reason:{case.get('reason', '')}""")
 
             # For problem-level checker stats: if checker exists, use per-case reasons to decide pass/fail counts
@@ -690,12 +701,11 @@ def evaluate_records(
                 elapsed = time.time() - started
                 avg = elapsed / max(1, total)
                 eta = avg * max(0, (len(id_to_row) - total))
-                print(f"""code:{item.get('code', '')}""")
                 print(f"Processed {total} problems | Correct: {correct} | pass@1: {correct / max(1, total):.3f} | avg {avg:.2f}s/problem | ETA ~{eta/60:.1f}m", flush=True)
 
     pass_at_1 = (correct / total) if total else 0.0
     metrics = {"num_attempted": total, "num_correct": correct, "pass_at_1": pass_at_1, "timestamp": time.time(), "stats": stats}
-    metrics_path = os.path.join(results_dir, "piston_eval_metrics.json")
+    metrics_path = os.path.join(final_results_dir, "piston_eval_metrics.json")
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
 
@@ -714,7 +724,7 @@ def evaluate_records(
 # ----------------------------
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Evaluate generated solutions with Piston (checker-aware) and produce stats")
-    p.add_argument("--solutions-path", default="/root/rllm/trav_test/solutions/qwen-qwen3-8b__open-r1-codeforces__default__test__vllm.jsonl")
+    p.add_argument("--solutions-path", default="/root/competitive-coding-ai/qwen-qwen2.5-7b-instruct__open-r1-codeforces__default__test__vllm_origin_t01_top095.jsonl")
     p.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
     p.add_argument("--generated-tests-dir", default="/root/takehome/open_rl_codeforces/generated_tests")
     p.add_argument("--max-generated-tests", type=int, default=0) # 0 disables, -1 all, N limits; TODO: all gen tests
@@ -724,7 +734,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-generated-bytes-per-problem", type=int, default=-1)
     p.add_argument("--generated-tests-workers", type=int, default=1)
     p.add_argument("--generated-tests-sample", type=float, default=1.0) #TODO: no-sampling 
-    p.add_argument("--results-dir", default="/root/rllm/trav_test/results")
+    p.add_argument("--results-dir", default="/root/competitive-coding-ai/results")
     return p
 
 def main() -> None:
