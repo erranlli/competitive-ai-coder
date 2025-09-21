@@ -1,30 +1,14 @@
 {
-  "bf16": {
-    "enabled": true
-  },
-  "fp16": {
-    "enabled": false
-  },
-  "zero_optimization": {
-    "stage": 2,
-    "allgather_partitions": true,
-    "allgather_bucket_size": 2e8,
-    "reduce_scatter": true,
-    "reduce_bucket_size": 2e8,
-    "overlap_comm": true,
-    "contiguous_gradients": true
-  },
-  "gradient_accumulation_steps": "auto",
-  "gradient_clipping": 1.0,
+  "bf16": { "enabled": true },
   "train_batch_size": "auto",
   "train_micro_batch_size_per_gpu": "auto",
-  "steps_per_print": 100,
-  "wall_clock_breakdown": false,
-  "activation_checkpointing": {
-    "partition_activations": true,
-    "cpu_checkpointing": false,
-    "contiguous_memory_optimization": true
+  "gradient_accumulation_steps": "auto",
+  "gradient_clipping": "auto",
+  "zero_optimization": {
+    "stage": 2,
+    "overlap_comm": true,
+    "contiguous_gradients": true,
+    "allgather_bucket_size": 5e8,
+    "reduce_bucket_size": 5e8
   }
 }
-
-
