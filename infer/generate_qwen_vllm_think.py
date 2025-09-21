@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Tuple, Optional
 from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoConfig
+from vllm import LLM, SamplingParams
 
 
 def ensure_dir(path: str) -> None:
@@ -153,87 +154,59 @@ def build_prompt_from_row(
         return f"You are an expert Python programmer. You will be given a question (problem specification) and will generate a correct Python program that matches the specification and passes all tests.\n\n\n{problem_text}\n{instruction}"
     
     else:
-        # Original enhanced style
-        examples_txt_lines: List[str] = []
-        for i, ex in enumerate(examples, 1):
-            ex_in = (ex.get("input") or "").strip()
-            ex_out = (ex.get("output") or "").strip()
-            
-            if ex_in or ex_out:
-                examples_txt_lines.append(f"Example {i}:")
-                examples_txt_lines.append(f"Input:\n{ex_in}")
-                examples_txt_lines.append(f"Output:\n{ex_out}")
-        
-        # Build problem statement
-        parts = [f"Title: {title}"]
-        
-        if description:
-            parts.extend(["", "Problem Description:", description.strip()])
-        
+        # Training-style prompt matching user's fine-tune instruction (sections and fenced examples)
+        def fmt_limits(val, unit):
+            try:
+                v = float(val)
+                if v.is_integer():
+                    return f"{int(v)} {unit}"
+                return f"{v} {unit}"
+            except Exception:
+                return f"{val} {unit}" if val else ""
+
+        ex_lines: List[str] = []
+        if isinstance(examples, list) and len(examples) > 0:
+            for idx, ex in enumerate(examples):
+                ex_in = (ex.get("input") or "").strip()
+                ex_out = (ex.get("output") or "").strip()
+                if ex_in or ex_out:
+                    ex_lines.append("```input\n" + ex_in + "\n```")
+                    ex_lines.append("```output\n" + ex_out + "\n```")
+                    if idx != len(examples) - 1:
+                        ex_lines.append("-----")
+        examples_block = "\n".join(ex_lines)
+
+        tl = fmt_limits(time_limit, "seconds") if time_limit else "2.0 seconds"
+        ml = fmt_limits(memory_limit, "megabytes") if memory_limit else "256.0 megabytes"
+
+        prompt_parts: List[str] = []
+        prompt_parts.append(
+            "You will be given a competitive programming problem.\n"
+            "Analyze the maximum input constraints and identify the optimal algorithmic approach and data structures needed to process the largest possible test cases within the time and memory limits, then explain why your chosen implementation strategy is the most efficient solution. Please reason step by step about your solution approach, then provide a complete implementation in Python 3 that is thoroughly optimized for both speed and memory usage.\n\n"
+            "Your solution must read input from standard input (input()), write output to standard output (print()).\n"
+            "Do not include any debug prints or additional output.\n\n"
+            "Put your final solution within a single code block:\n"
+            "```python\n"
+            "<your code here>\n"
+            "```"
+        )
+        prompt_parts.append("\n# Problem\n\n" + (description or "").strip())
+
+        constraints_lines: List[str] = ["## Constraints"]
+        constraints_lines.append(f"Time limit per test: {tl}")
+        constraints_lines.append(f"Memory limit per test: {ml}")
+        prompt_parts.append("\n" + "\n".join(constraints_lines))
+
         if input_format:
-            parts.extend(["", "Input Format:", input_format.strip()])
-        
+            prompt_parts.append("\n## Input Format\n" + input_format.strip())
         if output_format:
-            parts.extend(["", "Output Format:", output_format.strip()])
-        
+            prompt_parts.append("\n## Output Format\n" + output_format.strip())
+        if examples_block:
+            prompt_parts.append("\n## Examples\n" + examples_block)
         if note:
-            parts.extend(["", "Note:", note.strip()])
-        
-        if examples_txt_lines:
-            parts.extend(["", "Examples:", "\n\n".join(examples_txt_lines)])
-        
-        # Add metadata if available
-        metadata = []
-        if tags:
-            metadata.append(f"Tags: {tags}")
-        if time_limit:
-            metadata.append(f"Time Limit: {time_limit}")
-        if memory_limit:
-            metadata.append(f"Memory Limit: {memory_limit}")
-        
-        if metadata:
-            parts.extend(["", "Constraints:", "\n".join(metadata)])
-        
-        problem_stmt = "\n\n".join(p for p in parts if normalize_text(p))
-        
-        # Determine if we should add explicit thinking based on model type
-        model_type = detect_model_type(model_name)
-        should_add_thinking = (
-            explicit_thinking and 
-            enable_thinking and 
-            model_type != "deepseek-r1"
-        )
-        
-        # Model-specific thinking encouragement
-        thinking_section = ""
-        if should_add_thinking:
-            thinking_section = (
-                "First, analyze the problem step by step:\n"
-                "1. Understand what the problem is asking\n"
-                "2. Identify the input/output format and constraints\n"
-                "3. Consider the algorithm and approach needed\n"
-                "4. Think about edge cases and time complexity\n\n"
-            )
-        
-        # Enhanced instruction
-        base_instruction = (
-            "Write a correct and efficient Python 3 program that solves this problem.\n\n"
-            "Requirements:\n"
-            "- Read input from standard input (stdin) using input() or sys.stdin\n"
-            "- Write output to standard output (stdout) using print()\n"
-            "- Output format must match exactly (no extra spaces, newlines, or explanatory text)\n"
-            "- Solution must handle all constraints and edge cases\n"
-            "- Code should be efficient for typical competitive programming limits\n"
-            "- Use only standard Python libraries\n"
-        )
-        
-        if should_add_thinking:
-            instruction = thinking_section + base_instruction
-            instruction += "\nAfter your analysis, provide only the final code in a Python code block."
-        else:
-            instruction = base_instruction + "\nProvide only the code in a Python code block."
-        
-        return f"{problem_stmt}\n\n{instruction}"
+            prompt_parts.append("\n## Note\n" + note.strip())
+
+        return "\n\n".join([p for p in prompt_parts if normalize_text(p)])
 
 
 @dataclass
@@ -264,19 +237,26 @@ class GenConfig:
 
 
 def apply_chat_template(tokenizer: Any, user_prompt: str, enable_thinking: bool) -> str:
-    """Apply chat template with optional thinking capability."""
-    if enable_thinking:
-        system_prompt = (
-            "You are a helpful assistant. You are capable of thinking, reasoning, and planning. "
-            "You can express your thoughts within <think> and </think> tags."
-        )
-    else:
-        system_prompt = "You are a helpful coding assistant."
+    """Apply chat template with optional thinking capability.
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
+    When thinking is disabled, avoid injecting a system message to better match
+    instruction-tuned training prompts (single user message).
+    """
+    if enable_thinking:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a helpful assistant. You are capable of thinking, reasoning, and planning. "
+                    "You can express your thoughts within <think> and </think> tags."
+                ),
+            },
+            {"role": "user", "content": user_prompt},
+        ]
+    else:
+        messages = [
+            {"role": "user", "content": user_prompt}
+        ]
     try:
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     except Exception:
@@ -356,23 +336,17 @@ def generate_with_vllm(cfg: GenConfig) -> str:
         f"Requested TP={cfg.tensor_parallel_size} -> Using TP={chosen_tp}"
     )
 
-    from vllm import LLM, SamplingParams
-
-    llm_params = {
-        "model": model_to_use,
-        "trust_remote_code": True,
-        "tensor_parallel_size": chosen_tp,
-        "max_model_len": cfg.max_model_len,
-        "dtype": cfg.dtype,
-        "seed": cfg.seed,
-        "gpu_memory_utilization": cfg.gpu_memory_utilization,
-    }
-
-    if cfg.enable_thinking:
-        print("Enabling 'thinking' mode (prefix caching).")
-        llm_params["enable_prefix_caching"] = True
-
-    llm = LLM(**llm_params)
+    # Initialize LLM engine
+    llm = LLM(
+        model=model_to_use,
+        trust_remote_code=True,
+        tensor_parallel_size=chosen_tp,
+        max_model_len=cfg.max_model_len,
+        dtype=cfg.dtype,
+        seed=cfg.seed,
+        gpu_memory_utilization=cfg.gpu_memory_utilization,
+        enable_prefix_caching=bool(cfg.enable_thinking),
+    )
 
     sampling_params = SamplingParams(
         temperature=cfg.temperature,
@@ -401,13 +375,14 @@ def generate_with_vllm(cfg: GenConfig) -> str:
         ]
         ids = [row.get("id") or (row.get("contest_id", "") + "/" + row.get("index", "")) for row in batch]
         
+        # Generate responses using synchronous LLM.generate
         outputs = llm.generate(prompts, sampling_params)
-
+        
         with open(out_path, "a", encoding="utf-8") as w:
-            for i, out in enumerate(outputs):
-                raw_response = out.outputs[0].text if out.outputs else ""
+            for i, output in enumerate(outputs):
+                # Get the generated text from the first (and typically only) completion
+                raw_response = output.outputs[0].text if output.outputs else ""
                 code_text = extract_code_from_text(raw_response, language_hint="python")
-                
                 rec = {
                     "id": ids[i],
                     "model": cfg.model_name,
