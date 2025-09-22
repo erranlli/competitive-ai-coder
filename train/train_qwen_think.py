@@ -589,7 +589,7 @@ def main():
     )
 
     class WeightedSFTTrainer(SFTTrainer):
-        def compute_loss(self, model, inputs, return_outputs=False):
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
             loss_weights = inputs.pop("loss_weights", None)
             outputs = model(**inputs)
             if loss_weights is None:

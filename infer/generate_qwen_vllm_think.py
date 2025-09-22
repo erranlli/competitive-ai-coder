@@ -234,6 +234,10 @@ class GenConfig:
     enable_thinking: bool
     explicit_thinking: bool
     use_livecodebench_style: bool  # New parameter
+    # Decoding controls
+    no_repeat_ngram_size: int = 6
+    repetition_penalty: float = 1.1
+    stop: str = ""  # comma-separated list; defaults applied if empty
 
 
 def apply_chat_template(tokenizer: Any, user_prompt: str, enable_thinking: bool) -> str:
@@ -348,11 +352,23 @@ def generate_with_vllm(cfg: GenConfig) -> str:
         enable_prefix_caching=bool(cfg.enable_thinking),
     )
 
+    # Build stop sequences (CLI or env). Default: no stops
+    stop_list = None
+    if getattr(cfg, "stop", ""):
+        stop_list = [s for s in cfg.stop.split(",") if s]
+    if stop_list is None:
+        env_stop = os.environ.get("VLLM_STOP_OVERRIDES", "")
+        if env_stop:
+            parsed = [s for s in env_stop.split(",") if s]
+            stop_list = parsed if parsed else None
+
     sampling_params = SamplingParams(
         temperature=cfg.temperature,
         top_p=cfg.top_p,
         max_tokens=cfg.max_new_tokens,
-        stop=None,
+        stop=stop_list,
+        no_repeat_ngram_size=cfg.no_repeat_ngram_size,
+        repetition_penalty=cfg.repetition_penalty,
     )
     
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, trust_remote_code=True)
@@ -415,6 +431,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     
     p.add_argument("--temperature", type=float, default=0.6)
     p.add_argument("--top-p", type=float, default=0.95)
+    p.add_argument("--no-repeat-ngram-size", type=int, default=6)
+    p.add_argument("--repetition-penalty", type=float, default=1.1)
+    p.add_argument("--stop", type=str, default="", help="Comma-separated stop sequences; default to \n```,\n### Explanation,\n## Explanation")
     p.add_argument("--seed", type=int, default=0)
     
     p.add_argument("--enable-thinking", action="store_true", help="Enable thinking mode with <think> tags")
@@ -428,7 +447,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-problems", type=int, default=0)
     p.add_argument("--skip-non-stdio", action=argparse.BooleanOptionalAction, default=True)
     
-    p.set_defaults(enable_thinking=True, explicit_thinking=False, use_livecodebench_style=False)
+    # Default: disable thinking to reduce verbosity for instruction-tuned code models
+    p.set_defaults(enable_thinking=False, explicit_thinking=False, use_livecodebench_style=False)
     return p
 
 

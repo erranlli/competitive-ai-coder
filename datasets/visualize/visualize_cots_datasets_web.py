@@ -101,7 +101,7 @@ def render_sample(ds: Dataset, index: int) -> str:
 def main():
     ap = argparse.ArgumentParser(description="Gradio visualizer for two COTS-style datasets")
     #ap.add_argument("--path-a", default="/mnt/data2/new_codeforces_cots_high_quality_arrow")
-    ap.add_argument("--path-a", default="/mnt/data2/new_codeforces_cots_failed_arrow")
+    ap.add_argument("--path-a", default="/mnt/data2/filtered_datasets_flexible_match/successful_solutions")
     ap.add_argument("--path-b", default="/mnt/data2/new_deepcoder_cots_arrow_appexp")
     ap.add_argument("--num-samples", type=int, default=20)
     ap.add_argument("--port", type=int, default=12347)
