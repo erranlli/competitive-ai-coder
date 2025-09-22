@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "competitive-coding-ai"
+version = "0.1.0"
+description = "End-to-end pipeline for SFT, generation and evaluation of competitive programming solutions"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Competitive Coding AI Maintainers" }]
+dependencies = [
+  "torch>=2.2",
+  "transformers>=4.42",
+  "trl>=0.9.6",
+  "datasets>=2.20",
+  "deepspeed>=0.14",
+  "vllm>=0.5.0",
+  "pandas>=2.2",
+  "numpy>=1.26",
+  "tqdm>=4.66",
+  "requests>=2.31",
+  "pyarrow>=14.0",
+  "gradio>=4.37",
+]
+
+[project.optional-dependencies]
+rllm = [
+  "rllm @ git+https://github.com/rllm-org/rllm@main",
+]
+dev = [
+  "black>=24.3.0",
+  "isort>=5.13.0",
+  "ruff>=0.4.0",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = ["docs*"]
+
+

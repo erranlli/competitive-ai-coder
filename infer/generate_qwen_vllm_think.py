@@ -362,14 +362,23 @@ def generate_with_vllm(cfg: GenConfig) -> str:
             parsed = [s for s in env_stop.split(",") if s]
             stop_list = parsed if parsed else None
 
-    sampling_params = SamplingParams(
-        temperature=cfg.temperature,
-        top_p=cfg.top_p,
-        max_tokens=cfg.max_new_tokens,
-        stop=stop_list,
-        no_repeat_ngram_size=cfg.no_repeat_ngram_size,
-        repetition_penalty=cfg.repetition_penalty,
-    )
+    # Construct SamplingParams with broad compatibility across vLLM versions
+    try:
+        sampling_params = SamplingParams(
+            temperature=cfg.temperature,
+            top_p=cfg.top_p,
+            max_tokens=cfg.max_new_tokens,
+            stop=stop_list,
+            repetition_penalty=cfg.repetition_penalty,
+        )
+    except TypeError:
+        # Fallback without repetition_penalty for older vLLM versions
+        sampling_params = SamplingParams(
+            temperature=cfg.temperature,
+            top_p=cfg.top_p,
+            max_tokens=cfg.max_new_tokens,
+            stop=stop_list,
+        )
     
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, trust_remote_code=True)
     

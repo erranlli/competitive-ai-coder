@@ -1,0 +1,19 @@
+site_name: Competitive Coding AI
+site_description: End-to-end pipeline for SFT, generation, and evaluation of competitive programming solutions
+repo_url: https://github.com/erranlli/competitive-coding-ai
+docs_dir: .
+theme:
+  name: material
+nav:
+  - Home: README.md
+  - Datasets: datasets/README.md
+  - Training: train/README.md
+  - Inference: infer/README.md
+  - Evaluation: eval/README.md
+  - Data Utilities: data_util/README.md
+  - Benchmarks: benchmark/README.md
+markdown_extensions:
+  - admonition
+  - codehilite
+  - toc:
+      permalink: true
