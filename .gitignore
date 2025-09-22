@@ -1,0 +1,4 @@
+# Large data and model files
+*.jsonl
+model_solutions/
+bench_results/
