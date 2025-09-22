@@ -69,6 +69,10 @@ def load_and_format_dataset(
     max_samples: int = 0,
     single_arrow_file: Optional[str] = None,
     use_first_arrow_in_dir: bool = False,
+    enable_loss_reweight: bool = False,
+    loss_weight_code: float = 1.0,
+    loss_weight_noncode: float = 1.0,
+    mask_noncode: bool = False,
 ) -> Tuple[Dataset, Dataset]:
     ds = None
     # Fast path: load a single Arrow shard
@@ -260,10 +264,61 @@ def load_and_format_dataset(
 
         # 5. Create the labels and mask the prompt section.
         #    The first `prompt_length` tokens correspond to the user message and the assistant cue.
-        labels = tokenized["input_ids"].copy()
+        input_ids = tokenized["input_ids"]
+        labels = input_ids.copy()
         labels[:prompt_length] = [-100] * prompt_length
-        
         tokenized["labels"] = labels
+
+        # Optional: per-token loss reweighting (code vs non-code within assistant)
+        if enable_loss_reweight:
+            try:
+                # Build assistant-only token offsets
+                asst_text = messages[1]['content'] or ""
+                asst_tok = tokenizer(asst_text, add_special_tokens=False, return_offsets_mapping=True)
+                asst_offsets = asst_tok.get('offset_mapping', [])
+                asst_ids = asst_tok.get('input_ids', [])
+
+                # Identify code block character spans inside assistant text
+                code_spans: List[Tuple[int,int]] = []
+                for m in re.finditer(r"```python\s*[\r\n]+([\s\S]+?)```", asst_text, re.IGNORECASE):
+                    inner = m.group(1)
+                    # span of inner within asst_text
+                    start = m.start(1)
+                    end = m.end(1)
+                    code_spans.append((start, end))
+
+                def in_code(char_i: int) -> bool:
+                    for s,e in code_spans:
+                        if s <= char_i < e:
+                            return True
+                    return False
+
+                # Build assistant token weights
+                asst_weights: List[float] = []
+                for (s,e) in asst_offsets:
+                    if mask_noncode:
+                        w = (loss_weight_code if any(s < ce and e > cs for cs,ce in code_spans) else 0.0)
+                    else:
+                        w = (loss_weight_code if any(s < ce and e > cs for cs,ce in code_spans) else loss_weight_noncode)
+                    asst_weights.append(float(w))
+
+                # Full sequence weights: 0 for prompt (masked), assistant weights thereafter
+                full_len = len(input_ids)
+                weights = [0.0] * min(prompt_length, full_len)
+                weights.extend(asst_weights)
+                if len(weights) < full_len:
+                    weights.extend([loss_weight_noncode] * (full_len - len(weights)))
+                if len(weights) > full_len:
+                    weights = weights[:full_len]
+                # Ensure ignored labels have zero weight
+                for i, lab in enumerate(labels):
+                    if lab == -100:
+                        weights[i] = 0.0
+                tokenized["loss_weights"] = weights
+            except Exception:
+                # Fallback: no reweight
+                pass
+
         return tokenized
 
 
@@ -432,6 +487,11 @@ def main():
     p.add_argument("--single-arrow-file", type=str, default=None, help="Path to a single Arrow shard to load instead of the full dataset")
     p.add_argument("--use-first-arrow-in-dir", action="store_true", default=False, help="If set, load the first data-*.arrow file under the dataset dir")
     p.add_argument("--resume-from-checkpoint", type=str, default=None, help="Path to a checkpoint dir to resume from (e.g., output_dir/checkpoint-123 or 'last')")
+    # Loss re-weighting for code vs non-code tokens
+    p.add_argument("--enable-loss-reweight", action="store_true", default=False, help="Enable per-token loss re-weighting (code vs non-code)")
+    p.add_argument("--loss-weight-code", type=float, default=2.0, help="Loss weight for code tokens inside ```python blocks")
+    p.add_argument("--loss-weight-noncode", type=float, default=0.2, help="Loss weight for non-code assistant tokens")
+    p.add_argument("--mask-noncode", action="store_true", default=False, help="If set, non-code assistant tokens are masked from loss entirely")
     
     args = p.parse_args()
 
@@ -451,7 +511,11 @@ def main():
     train_dataset, eval_dataset = load_and_format_dataset(
         args.dataset_path, tokenizer, args.validation_split_percentage,
         max_seq_length=args.max_seq_length, max_samples=args.max_train_samples,
-        single_arrow_file=args.single_arrow_file, use_first_arrow_in_dir=args.use_first_arrow_in_dir
+        single_arrow_file=args.single_arrow_file, use_first_arrow_in_dir=args.use_first_arrow_in_dir,
+        enable_loss_reweight=args.enable_loss_reweight,
+        loss_weight_code=args.loss_weight_code,
+        loss_weight_noncode=args.loss_weight_noncode,
+        mask_noncode=args.mask_noncode
     )
 
     print("Loading model...")
@@ -472,7 +536,7 @@ def main():
     except Exception:
         world_size = 1
     updates_per_epoch = max(1, math.ceil(len(train_dataset) / (args.per_device_train_batch_size * world_size * args.gradient_accumulation_steps)))
-    save_steps_calc = max(1, updates_per_epoch * 2)  # every 2 epochs
+    save_steps_calc = max(1, updates_per_epoch * 1)  # every 1 epochs
     log_steps_calc = max(1, updates_per_epoch // 2)  # ~ every 0.5 epoch
 
     # Build TrainingArguments with compatibility across Transformers versions
@@ -494,7 +558,7 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         gradient_checkpointing=True,
         learning_rate=args.learning_rate,
-        weight_decay=0.1,
+        weight_decay=0.05, # For instruction/code SFT, common successful ranges are 0.01–0.05; TODO
         warmup_ratio=args.warmup_ratio,
         lr_scheduler_type="cosine",
         logging_steps=log_steps_calc,
@@ -503,6 +567,7 @@ def main():
         report_to=args.report_to,
         remove_unused_columns=False,
         dataloader_pin_memory=False,
+        max_grad_norm=0.5, # curb exploding updates that drive verbosity and repetition
     )
     if strategy_key is not None:
         ta_kwargs[strategy_key] = eval_strategy_value
@@ -523,7 +588,86 @@ def main():
         pad_to_multiple_of=8
     )
 
-    trainer = SFTTrainer(
+    class WeightedSFTTrainer(SFTTrainer):
+        def compute_loss(self, model, inputs, return_outputs=False):
+            loss_weights = inputs.pop("loss_weights", None)
+            outputs = model(**inputs)
+            if loss_weights is None:
+                return (outputs.loss, outputs) if return_outputs else outputs.loss
+
+            try:
+                logits = outputs.get("logits", None)
+                labels = inputs.get("labels", None)
+                if logits is None or labels is None:
+                    return (outputs.loss, outputs) if return_outputs else outputs.loss
+
+                # Shift for next-token prediction
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+
+                # Per-token CE loss (no reduction)
+                loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+                per_token_loss = loss_fct(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1)
+                )
+
+                # Convert and align weights to [B, T]
+                B, T = labels.size(0), labels.size(1)
+                device = labels.device
+                dtype = per_token_loss.dtype
+
+                w = loss_weights
+                if not torch.is_tensor(w):
+                    try:
+                        w = torch.tensor(w, device=device, dtype=dtype)
+                    except Exception:
+                        w = None
+                if w is None:
+                    return (outputs.loss, outputs) if return_outputs else outputs.loss
+
+                # Ensure 2D [B, T]
+                if w.dim() == 1:
+                    if w.numel() == T:
+                        w = w.view(1, T).expand(B, T)
+                    elif w.numel() == B * T:
+                        w = w.view(B, T)
+                    else:
+                        w = w.new_ones((B, T))
+                elif w.dim() == 2:
+                    # Pad/trim rows/cols to [B,T]
+                    if w.size(0) != B:
+                        if w.size(0) > B:
+                            w = w[:B, :]
+                        else:
+                            pad_rows = B - w.size(0)
+                            w = torch.cat([w, w.new_ones((pad_rows, min(w.size(1), T)))], dim=0)
+                    if w.size(1) != T:
+                        if w.size(1) > T:
+                            w = w[:, :T]
+                        else:
+                            pad_cols = T - w.size(1)
+                            w = torch.cat([w, w.new_ones((B, pad_cols))], dim=1)
+                else:
+                    w = w.view(B, T)
+
+                # Shift weights to align with shifted labels
+                shifted_weights = w[..., 1:].contiguous()
+                flat_weights = shifted_weights.view(-1)
+
+                # Valid tokens mask (ignore -100)
+                valid_mask = (shift_labels.view(-1) != -100)
+
+                weighted_loss = per_token_loss * flat_weights
+                sum_weighted = weighted_loss[valid_mask].sum()
+                sum_weights = flat_weights[valid_mask].sum()
+                loss = sum_weighted / torch.clamp(sum_weights, min=1.0)
+
+                return (loss, outputs) if return_outputs else loss
+            except Exception:
+                return (outputs.loss, outputs) if return_outputs else outputs.loss
+
+    trainer = WeightedSFTTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,

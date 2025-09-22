@@ -3,6 +3,7 @@ import os
 import glob
 import torch
 import shutil
+import argparse
 from transformers import AutoTokenizer, AutoConfig
 
 # IMPORTANT: This line tells PyTorch and DeepSpeed to not use any GPUs
@@ -11,13 +12,22 @@ os.environ['CUDA_VISIBLE_DEVICES'] = ''
 from deepspeed.utils.zero_to_fp32 import convert_zero_checkpoint_to_fp32_state_dict
 
 def main():
-    # --- CONFIGURE THESE PATHS ---
-    # This should be the main output directory that contains the 'checkpoint-xxx' folder(s).
-    output_dir = "/root/competitive-coding-ai/deepcoder-run2-z3-optimized"
-    
-    # This is the original base model you used for fine-tuning.
-    base_model_name = "Qwen/Qwen2.5-7B-Instruct"
-    # --- END OF CONFIGURATION ---
+    parser = argparse.ArgumentParser(description="CPU-only consolidation of DeepSpeed checkpoints into HF weights")
+    parser.add_argument(
+        "--output-dir",
+        required=True,
+        help="Training output directory containing checkpoint-*/; consolidated weights are saved in-place",
+    )
+    parser.add_argument(
+        "--base-model-name",
+        default="Qwen/Qwen2.5-7B-Instruct",
+        help="Base model name used to save tokenizer/config alongside consolidated weights",
+    )
+    args = parser.parse_args()
+
+    # Paths
+    output_dir = args.output_dir
+    base_model_name = args.base_model_name
 
     print("--- Starting CPU-Only DeepSpeed Checkpoint Consolidation ---")
 

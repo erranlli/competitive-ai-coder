@@ -3,17 +3,18 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 import os
 import shutil
+import argparse
 
-# --- CONFIGURE YOUR PATHS HERE ---
+def parse_args():
+    ap = argparse.ArgumentParser(description="Merge HF sharded checkpoint into a single-file directory (CPU-only)")
+    ap.add_argument("--input-dir", required=True, help="Path to sharded model directory (containing shards/index)")
+    ap.add_argument("--output-dir", required=True, help="Path to write single-file model directory")
+    ap.add_argument("--max-shard-size", default="40GB", help="Max shard size used when saving (forces single file if large)")
+    return ap.parse_args()
 
-# 1. Set the path to your current, sharded model directory.
-#    This is the directory that contains the pytorch_model.bin.index.json file.
-sharded_model_path = "/root/competitive-coding-ai/deepcoder-run2-z3-optimized"
-
-# 2. Set the path for the new directory where the single-file model will be saved.
-single_file_output_path = "/root/competitive-coding-ai/final_qwen2.5-7b-deepcoder-SINGLE-FILE"
-
-# --- END OF CONFIGURATION ---
+args = parse_args()
+sharded_model_path = args.input_dir
+single_file_output_path = args.output_dir
 
 print("--- Starting Shard Consolidation to a Single File ---")
 
@@ -51,7 +52,7 @@ model = AutoModelForCausalLM.from_pretrained(
 print(f"Saving consolidated model to: {single_file_output_path}")
 model.save_pretrained(
     single_file_output_path,
-    max_shard_size="40GB" # Set higher than the model size to guarantee a single file
+    max_shard_size=args.max_shard_size # Set higher than the model size to guarantee a single file
 )
 
 # 3. Load and save the tokenizer to the new directory.
