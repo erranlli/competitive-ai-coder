@@ -1,105 +1,70 @@
-# Model Evaluation
+# Evaluation with Piston (+ Generated Tests and Checkers)
 
-This directory contains instructions to setup code evaluation docker and run model evaluation with respect to benchmarks. 
+Scripts to evaluate model solutions against the `open-r1/codeforces` dataset using a Piston-compatible execution service, with support for problem-provided checkers and generated tests. The main entrypoint is `eval_with_piston_gentest_checker_stats.py`.
 
-## Setup Evaluation Docker
-Default docker configuration has several issuesm e.g. very small payload. Follow instructions below to setup a proper evaluation docker.  
+## Important: Piston server defaults are not enough
 
-### clone and enter repo
+The default Piston server configuration often fails for our workloads:
+ - JSON body/`stdin` size limits can truncate big inputs
+ - Inconsistent error reporting under large payloads
+
+We work around this by replacing stdin with a file when inputs are large:
+ - Embed large input as `input.txt` in Piston `files`
+ - Prepend a Python prelude to the user code to redirect `sys.stdin` to `input.txt`
+ - Keep JSON `stdin` empty in that case
+
+This logic is implemented in `run_piston_test()` in `eval_with_piston_gentest_checker_stats.py` and is required for stable evaluation.
+
+## Quickstart
+
+Ensure a Piston-compatible API is reachable (defaults to `http://localhost:2000`). Then run:
+
+```bash
+python eval/eval_with_piston_gentest_checker_stats.py \
+  --solutions-path model_solutions/your_model__open-r1-codeforces__default__test__vllm.jsonl \
+  --endpoint http://localhost:2000 \
+  --generated-tests-dir /path/to/generated_tests \
+  --max-generated-tests 0 \
+  --results-dir results
+```
+
+Key options:
+ - `--max-generated-tests`: 0 disables, -1 all, N first N
+ - `--sort-generated-tests`: `none | small_first | large_first`
+ - `--skip-large-inputs-over`: skip excessively large inputs (bytes)
+ - `--max-generated-bytes-per-problem`: cap generated input bytes budget
+ - `--generated-tests-sample`: (0,1] downsample fraction
+ - `--generated-tests-workers`: >1 enables concurrent generated tests
+
+## Server setup (example)
+
+If you deploy your own server, raise payload/time/memory limits. Example approach with Piston:
+
+```bash
 git clone https://github.com/engineer-man/piston
-
-### Build your new, fixed image from the Dockerfile
+cd piston
 docker build -t piston-fixed .
-
-### Stop any old container
-docker stop piston_api
-docker rm piston_api
-
-### Run the new image. The command is now simple and clean!
-docker run \
-    --privileged \
-    -dit \
-    -p 2000:2000 \
-    --name piston_api \
-    --env-file ./piston.env \
-    piston-fixed
-
-### Install latest python
+docker stop piston_api || true && docker rm piston_api || true
+docker run --privileged -dit -p 2000:2000 --name piston_api --env-file ./piston.env piston-fixed
 cli/index.js ppman install python
+```
 
-# Run evaluation
+Even with relaxed limits, keep the stdin-as-file workaround in place for robustness.
 
-python  eval_with_piston_gentest_checker_stats.py \
-  --solutions-path model_solutions/deepseek-ai-deepseek-r1-0528-qwen3-8b__open-r1-codeforces__default__test__vllm.jsonl
+## Outputs
 
-python  eval/eval_with_piston_gentest_checker_stats.py \
---solutions-path /root/competitive-coding-ai/final_model_solutions/qwen-qwen2.5-7b-instruct__open-r1-codeforces__default__test__vllm.jsonl 2>&1 | tee final_repod_eval.txt
+- Results JSONL: `results/<solutions_prefix>/piston_eval_results.jsonl`
+- Metrics JSON: `results/<solutions_prefix>/piston_eval_metrics.json`
 
-  python infer/generate_qwen_vllm_think.py   --dataset-name open-r1/codeforces --subset default --split test   --model-name "Qwen/Qwen2.5-7B-Instruct"   --checkpoint-path /root/rllm/trav_test/final_qwen2.5-7b-mot-full-run0   --batch-size 64   --max-model-len 32768 --max-new-tokens 10240   --tensor-parallel-size 8 --gpu-ids 0,1,2,3,4,5,6,7   --dtype bfloat16   --temperature 0.1 --top-p 0.95   --results-dir /root/competitive-coding-ai/final_model_solutions 2>&1 | tee final_reprod_ed.txt  
+Per-case records include: `case_type` (official/generated), `test_case_i` (if available), `passed`, `output`, `expected`, `error`, `reason`.
 
-=== EVALUATION SUMMARY === 
-{
-  "num_attempted": 468,
-  "num_correct": 20,
-  "pass_at_1": 0.042735042735042736,
-  "timestamp": 1758441492.0865378,
-  "stats": {
-    "num_problems_total": 468,
-    "num_with_checker": 53,
-    "with_checker_passed": 53,
-    "with_checker_failed": 0,
-    "num_without_checker": 415,
-    "without_checker_passed": 20,
-    "failure_reasons": {
-      "runtime_error": 1632,
-      "time_limit_exceeded": 495,
-      "memory_limit_exceeded": 47,
-      "failed_outputs_match": 8
-    }
-  }
-}
+## Dependencies
 
-Failure reasons summary:
-  runtime_error: 1632   # 8 epochs: overfitted!!
-  time_limit_exceeded: 495
-  memory_limit_exceeded: 47
-  failed_outputs_match: 8 # this is so low!!
+- `datasets`, `pandas`, `requests`
+- Python 3.10+
 
-Compared with baseline:
-  failed_outputs_match: 890
-  runtime_error: 560
-  failed_checker: 503
-  time_limit_exceeded: 12
+## Troubleshooting
 
-(piston_env) root@ml-ai-ubuntu-gpu-h200x8-1128gb-nyc2:~/competitive-coding-ai# python  eval/eval_with_piston_gentest_checker_stats.py --solutions-path /root/competitive-coding-ai/model_solutions/qwen-qwen2.5-7b-instruct__open-r1-codeforces__default__test__vllm_origin_t01_top095.jsonl 2>&1 | tee final_qwen25_7b_instruct_t01_top095_baseline.txt
-
-=== EVALUATION SUMMARY ===
-{
-  "num_attempted": 468,
-  "num_correct": 29,
-  "pass_at_1": 0.06196581196581197,
-  "timestamp": 1758442843.1173468,
-  "stats": {
-    "num_problems_total": 468,
-    "num_with_checker": 53,
-    "with_checker_passed": 11,
-    "with_checker_failed": 42,
-    "num_without_checker": 415,
-    "without_checker_passed": 26,
-    "failure_reasons": {
-      "runtime_error": 560,
-      "failed_outputs_match": 890,
-      "failed_checker": 503,
-      "time_limit_exceeded": 12
-    }
-  }
-}
-
-Failure reasons summary:
-  failed_outputs_match: 890
-  runtime_error: 560
-  failed_checker: 503
-  time_limit_exceeded: 12
-
-Saved detailed results to: /root/competitive-coding-ai/results/qwen-qwen2.5-7b-instruct__open-r1-codeforces__default__test__vllm_origin_t01_top095/piston_eval_results.jsonl
-Saved metrics to: /root/competitive-coding-ai/results/qwen-qwen2.5-7b-instruct__open-r1-codeforces__default__test__vllm_origin_t01_top095/piston_eval_metrics.json
+- Connection errors: verify endpoint/container health
+- Runtime errors with big inputs: confirm stdin replacement occurred; try `--sort-generated-tests small_first`
+- Checker misreporting: some checkers are ambiguous; see `failed_checker`/`checker_unclear` and inspect `stdout`/`stderr`

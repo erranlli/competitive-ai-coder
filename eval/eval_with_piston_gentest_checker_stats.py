@@ -668,7 +668,7 @@ def evaluate_records(
                 #    print(f"""problem:{problem_id}, test_case:{case.get('test_case_i', '')}, error:{case.get('error','')}, reason:{case.get('reason', '')}""")
 
             else:
-                for case in per_case:
+                for case in per_case: #Erran: TODO
                     if not case['passed']:
                         print(f"""code:{item.get('code', '')}""")
                         print(f"""model output:{case.get('output', '')}, expected output:{case.get('expected', '')}""")
