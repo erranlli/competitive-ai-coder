@@ -457,7 +457,7 @@ def main():
     print("Loading model...")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name, trust_remote_code=True,
-        torch_dtype=torch.bfloat16, use_cache=False, attn_implementation="flash_attention_2"
+        dtype=torch.bfloat16, use_cache=False, attn_implementation="flash_attention_2"
     )
 
     # (Removed LoRA/PEFT configuration)
@@ -475,25 +475,45 @@ def main():
     save_steps_calc = max(1, updates_per_epoch * 2)  # every 2 epochs
     log_steps_calc = max(1, updates_per_epoch // 2)  # ~ every 0.5 epoch
 
-    training_args = TrainingArguments(
+    # Build TrainingArguments with compatibility across Transformers versions
+    ta_fields = getattr(TrainingArguments, "__dataclass_fields__", {})
+    strategy_key = "evaluation_strategy" if "evaluation_strategy" in ta_fields else (
+        "eval_strategy" if "eval_strategy" in ta_fields else None
+    )
+
+    ta_kwargs = dict(
         output_dir=args.output_dir,
         deepspeed=args.deepspeed if int(os.environ.get("WORLD_SIZE", "1")) > 1 else None,
-        bf16=True, do_train=True, do_eval=do_eval,
-        eval_strategy=eval_strategy_value, eval_steps=log_steps_calc,
-        save_strategy="steps", save_steps=save_steps_calc,
+        bf16=True,
+        do_train=True,
+        do_eval=do_eval,
+        eval_steps=log_steps_calc,
+        save_strategy="steps",
+        save_steps=save_steps_calc,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         gradient_checkpointing=True,
-        learning_rate=args.learning_rate, weight_decay=0.1,
-        warmup_ratio=args.warmup_ratio, lr_scheduler_type="cosine",
+        learning_rate=args.learning_rate,
+        weight_decay=0.1,
+        warmup_ratio=args.warmup_ratio,
+        lr_scheduler_type="cosine",
         logging_steps=log_steps_calc,
         save_total_limit=3,
-        load_best_model_at_end=False, #TODO load_best_value, metric_for_best_model="eval_loss", greater_is_better=False,
         num_train_epochs=args.num_train_epochs,
         report_to=args.report_to,
         remove_unused_columns=False,
         dataloader_pin_memory=False,
     )
+    if strategy_key is not None:
+        ta_kwargs[strategy_key] = eval_strategy_value
+    if "load_best_model_at_end" in ta_fields:
+        ta_kwargs["load_best_model_at_end"] = load_best_value
+    if "metric_for_best_model" in ta_fields:
+        ta_kwargs["metric_for_best_model"] = "eval_loss"
+    if "greater_is_better" in ta_fields:
+        ta_kwargs["greater_is_better"] = False
+
+    training_args = TrainingArguments(**ta_kwargs)
 
     # Data collator that pads input_ids AND labels (label_pad_token_id=-100)
     data_collator = DataCollatorForSeq2Seq(
