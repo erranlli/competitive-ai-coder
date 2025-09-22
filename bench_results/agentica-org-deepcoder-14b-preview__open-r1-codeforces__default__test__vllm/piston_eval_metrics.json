@@ -1,0 +1,21 @@
+{
+  "num_attempted": 468,
+  "num_correct": 164,
+  "pass_at_1": 0.3504273504273504,
+  "timestamp": 1758395726.3801003,
+  "stats": {
+    "num_problems_total": 468,
+    "num_with_checker": 53,
+    "with_checker_passed": 25,
+    "with_checker_failed": 28,
+    "num_without_checker": 415,
+    "without_checker_passed": 152,
+    "failure_reasons": {
+      "failed_outputs_match": 551,
+      "runtime_error": 752,
+      "failed_checker": 177,
+      "memory_limit_exceeded": 9,
+      "time_limit_exceeded": 72
+    }
+  }
+}
