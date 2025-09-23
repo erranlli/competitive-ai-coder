@@ -6,9 +6,9 @@ import shutil
 import argparse
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Merge HF sharded checkpoint into a single-file directory (CPU-only)")
-    ap.add_argument("--input-dir", required=True, help="Path to sharded model directory (containing shards/index)")
-    ap.add_argument("--output-dir", required=True, help="Path to write single-file model directory")
+    ap = argparse.ArgumentParser(description="Merge HF sharded (or unify single-file) checkpoint into a single-file directory (CPU-only)")
+    ap.add_argument("--input-dir", "--input", dest="input_dir", required=True, help="Path to model directory (sharded or single-file)")
+    ap.add_argument("--output-dir", "--output", dest="output_dir", required=True, help="Path to write single-file model directory")
     ap.add_argument("--max-shard-size", default="40GB", help="Max shard size used when saving (forces single file if large)")
     return ap.parse_args()
 
@@ -37,6 +37,64 @@ if not os.path.isfile(root_index_json) and os.path.isdir(subdir) and os.path.isf
 
 # Load config from the root directory (config is usually at the top-level)
 config = AutoConfig.from_pretrained(sharded_model_path)
+
+# Fast-path: directory already contains a single weight file (but maybe non-standard name)
+def copy_if_single_file(src_dir: str, dst_dir: str) -> bool:
+    """If src_dir already has a single .bin/.safetensors weight file, copy/normalize it and tokenizer/config.
+    Returns True if handled, False otherwise.
+    """
+    # Preferred names
+    std_bin = os.path.join(src_dir, "pytorch_model.bin")
+    std_safe = os.path.join(src_dir, "model.safetensors")
+    os.makedirs(dst_dir, exist_ok=True)
+    copied = False
+    if os.path.isfile(std_bin):
+        shutil.copy2(std_bin, os.path.join(dst_dir, "pytorch_model.bin"))
+        copied = True
+    elif os.path.isfile(std_safe):
+        shutil.copy2(std_safe, os.path.join(dst_dir, "model.safetensors"))
+        copied = True
+    else:
+        # Look for a likely consolidated bin (e.g., pytorch_model_202.bin)
+        cand = None
+        for name in sorted(os.listdir(src_dir)):
+            if name.endswith(".bin") and name.startswith("pytorch_model_"):
+                cand = os.path.join(src_dir, name)
+                break
+        if cand and os.path.isfile(cand):
+            shutil.copy2(cand, os.path.join(dst_dir, "pytorch_model.bin"))
+            copied = True
+
+    if copied:
+        # Copy common config/tokenizer artifacts if present
+        for fname in [
+            "config.json",
+            "generation_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "vocab.json",
+            "merges.txt",
+            "added_tokens.json",
+            "chat_template.jinja",
+        ]:
+            src = os.path.join(src_dir, fname)
+            if os.path.isfile(src):
+                try:
+                    shutil.copy2(src, os.path.join(dst_dir, fname))
+                except Exception:
+                    pass
+        print(f"Detected existing single-file weights in '{src_dir}'. Copied/normalized into '{dst_dir}'.")
+        return True
+    return False
+
+# If already single-file, just copy/normalize and exit
+root_index_json = os.path.join(weights_dir, "pytorch_model.bin.index.json")
+if not os.path.isfile(root_index_json):
+    handled = copy_if_single_file(weights_dir, single_file_output_path)
+    if handled:
+        print("Done (no merge needed).")
+        exit(0)
 
 # We use device_map="cpu" to ensure no GPUs are used.
 model = AutoModelForCausalLM.from_pretrained(

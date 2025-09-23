@@ -674,7 +674,6 @@ def main():
         eval_dataset=eval_dataset,
         peft_config=None,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience)] if do_eval else None,
-        packing=args.packing,
         max_seq_length=args.max_seq_length,
         data_collator=data_collator,
     )
