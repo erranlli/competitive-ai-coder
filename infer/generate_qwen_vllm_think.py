@@ -239,7 +239,7 @@ class GenConfig:
     enable_thinking: bool
     use_livecodebench_style: bool  # New parameter
     # Decoding controls
-    no_repeat_ngram_size: int = 6
+    # no_repeat_ngram_size: int = 6
     repetition_penalty: float = 1.1
     stop: str = ""  # comma-separated list; defaults applied if empty
 
@@ -568,9 +568,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     
     p.add_argument("--temperature", type=float, default=0.6)
     p.add_argument("--top-p", type=float, default=0.95)
-    p.add_argument("--no-repeat-ngram-size", type=int, default=6)
+    #p.add_argument("--no-repeat-ngram-size", type=int, default=6)
     p.add_argument("--repetition-penalty", type=float, default=1.1)
-    p.add_argument("--stop", type=str, default="", help="Comma-separated stop sequences; default to \n```,\n### Explanation,\n## Explanation")
+    p.add_argument("--stop", type=str, default="", help="Comma-separated stop sequences; default to \n## Explanation")
     p.add_argument("--seed", type=int, default=0)
     
     p.add_argument("--enable-thinking", action="store_true", help="Enable thinking mode with <think> tags")

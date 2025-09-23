@@ -229,96 +229,74 @@ def load_and_format_dataset(
     def map_and_tokenize_row(row: Dict[str, Any]) -> Dict[str, Any]:
         messages = build_messages_from_row(row)
         
-        # Ensure the conversation is a valid single-turn exchange
         if not (len(messages) == 2 and messages[0]['role'] == 'user' and messages[1]['role'] == 'assistant'):
             return {"input_ids": [], "labels": []}
 
-        # 1. Create the prompt text by applying the template to the user message only.
-        #    `add_generation_prompt=True` tells the tokenizer to add the special tokens
-        #    that cue the assistant's response (e.g., for Qwen2, it adds `<|im_start|>assistant\n`).
-        #    This gives us the exact prefix that needs to be masked.
+        # --- Step 1: Get prompt text to calculate its length ---
         prompt_text = tokenizer.apply_chat_template(
-            [messages[0]],  # Only the user message
+            [messages[0]],
             tokenize=False, 
             add_generation_prompt=True
         )
-        
-        # 2. Create the full conversation text, which includes the assistant's solution.
+        prompt_length = len(tokenizer(prompt_text, add_special_tokens=False)['input_ids'])
+
+        # --- Step 2: Get the FULL text for a single, unified tokenization ---
         full_text = tokenizer.apply_chat_template(
             messages, 
             tokenize=False, 
             add_generation_prompt=False
         )
 
-        # 3. Tokenize the prompt text to find its length.
-        prompt_token_ids = tokenizer(prompt_text, add_special_tokens=False)['input_ids']
-        prompt_length = len(prompt_token_ids)
-
-        # 4. Tokenize the full text. This is what the model will actually see.
+        # --- Step 3: Perform the SINGLE, DEFINITIVE tokenization ---
+        # We ask for offset_mapping to link tokens back to characters
         tokenized = tokenizer(
             full_text,
             truncation=True,
             padding=False,
             max_length=max_seq_length,
             add_special_tokens=False,
+            return_offsets_mapping=True, # <-- CRITICAL
         )
-
-        # 5. Create the labels and mask the prompt section.
-        #    The first `prompt_length` tokens correspond to the user message and the assistant cue.
         input_ids = tokenized["input_ids"]
-        labels = input_ids.copy()
+        offsets = tokenized.pop("offset_mapping") # Pop it so it's not passed to the model
+
+        # --- Step 4: Create labels and mask the prompt ---
+        labels = list(input_ids) # Use list() for mutability
         labels[:prompt_length] = [-100] * prompt_length
         tokenized["labels"] = labels
 
-        # Optional: per-token loss reweighting (code vs non-code within assistant)
+        # --- Step 5: (Optional) Calculate and apply loss weights ---
         if enable_loss_reweight:
-            try:
-                # Build assistant-only token offsets
-                asst_text = messages[1]['content'] or ""
-                asst_tok = tokenizer(asst_text, add_special_tokens=False, return_offsets_mapping=True)
-                asst_offsets = asst_tok.get('offset_mapping', [])
-                asst_ids = asst_tok.get('input_ids', [])
+            # Find character spans of the code *within the full_text*
+            assistant_start_char = len(prompt_text) # The assistant response starts after the prompt
+            
+            code_spans: List[Tuple[int, int]] = []
+            # We search in the full_text, not the isolated assistant text
+            for m in re.finditer(r"```python\s*[\r_n]+([\s\S]+?)```", full_text, re.IGNORECASE):
+                # We only care about the inner content of the code block for weighting
+                start_char = m.start(1)
+                end_char = m.end(1)
+                code_spans.append((start_char, end_char))
 
-                # Identify code block character spans inside assistant text
-                code_spans: List[Tuple[int,int]] = []
-                for m in re.finditer(r"```python\s*[\r\n]+([\s\S]+?)```", asst_text, re.IGNORECASE):
-                    inner = m.group(1)
-                    # span of inner within asst_text
-                    start = m.start(1)
-                    end = m.end(1)
-                    code_spans.append((start, end))
+            # Create weights based on the character offsets of our SINGLE tokenization
+            weights = [loss_weight_noncode] * len(input_ids)
+            for i, (start_char_offset, end_char_offset) in enumerate(offsets):
+                # Check if the token's character span overlaps with any code block span
+                is_code_token = False
+                for code_start, code_end in code_spans:
+                    # A token is a "code token" if it has any overlap with a code span
+                    if max(start_char_offset, code_start) < min(end_char_offset, code_end):
+                        is_code_token = True
+                        break
+                
+                if is_code_token:
+                    weights[i] = loss_weight_code
 
-                def in_code(char_i: int) -> bool:
-                    for s,e in code_spans:
-                        if s <= char_i < e:
-                            return True
-                    return False
-
-                # Build assistant token weights
-                asst_weights: List[float] = []
-                for (s,e) in asst_offsets:
-                    if mask_noncode:
-                        w = (loss_weight_code if any(s < ce and e > cs for cs,ce in code_spans) else 0.0)
-                    else:
-                        w = (loss_weight_code if any(s < ce and e > cs for cs,ce in code_spans) else loss_weight_noncode)
-                    asst_weights.append(float(w))
-
-                # Full sequence weights: 0 for prompt (masked), assistant weights thereafter
-                full_len = len(input_ids)
-                weights = [0.0] * min(prompt_length, full_len)
-                weights.extend(asst_weights)
-                if len(weights) < full_len:
-                    weights.extend([loss_weight_noncode] * (full_len - len(weights)))
-                if len(weights) > full_len:
-                    weights = weights[:full_len]
-                # Ensure ignored labels have zero weight
-                for i, lab in enumerate(labels):
-                    if lab == -100:
-                        weights[i] = 0.0
-                tokenized["loss_weights"] = weights
-            except Exception:
-                # Fallback: no reweight
-                pass
+            # Mask out the prompt tokens from the weights
+            for i in range(min(prompt_length, len(weights))):
+                weights[i] = 0.0
+                
+            tokenized["loss_weights"] = weights
 
         return tokenized
 
@@ -594,37 +572,32 @@ def main():
             loss_weights = inputs.pop("loss_weights", None)
             outputs = model(**inputs)
             if loss_weights is None:
-                # Also log extra metrics even when not using weights
+                # Compute and stash extra metrics; merge at on_log for single-line printing
                 try:
                     logits = outputs.get("logits", None)
                     labels = inputs.get("labels", None)
                     if logits is not None and labels is not None:
-                        # Compute mean token accuracy, entropy, and cumulative tokens
                         with torch.no_grad():
                             shift_logits = logits[..., :-1, :].contiguous()
                             shift_labels = labels[..., 1:].contiguous()
-
                             valid_mask = (shift_labels != -100)
                             if valid_mask.any():
-                                # Accuracy
                                 pred_tokens = shift_logits.argmax(dim=-1)
                                 correct = (pred_tokens == shift_labels) & valid_mask
                                 mean_acc = (correct.sum().float() / valid_mask.sum().float()).item()
-                                # Entropy
                                 log_probs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
                                 probs = torch.exp(log_probs)
                                 ent = (-probs * log_probs).sum(dim=-1)
                                 mean_ent = ent[valid_mask].mean().item()
-                                # Cumulative token counter
                                 if not hasattr(self, "_cumulative_tokens"):
                                     self._cumulative_tokens = 0.0
                                 self._cumulative_tokens += float(valid_mask.sum().item())
-                                self.log({
+                                self._last_extra_metrics = {
                                     "mean_token_accuracy": mean_acc,
                                     "entropy": mean_ent,
                                     "num_tokens": float(self._cumulative_tokens),
                                     "epoch": float(getattr(self.state, "epoch", 0.0) or 0.0),
-                                })
+                                }
                 except Exception:
                     pass
                 return (outputs.loss, outputs) if return_outputs else outputs.loss
@@ -697,7 +670,7 @@ def main():
                 sum_weights = flat_weights[valid_mask].sum()
                 loss = sum_weighted / torch.clamp(sum_weights, min=1.0)
 
-                # Extra metrics: accuracy, entropy, cumulative tokens
+                # Stash extra metrics for merging at log-time
                 try:
                     with torch.no_grad():
                         valid_mask = (shift_labels != -100)
@@ -712,12 +685,12 @@ def main():
                             if not hasattr(self, "_cumulative_tokens"):
                                 self._cumulative_tokens = 0.0
                             self._cumulative_tokens += float(valid_mask.sum().item())
-                            self.log({
+                            self._last_extra_metrics = {
                                 "mean_token_accuracy": mean_acc,
                                 "entropy": mean_ent,
                                 "num_tokens": float(self._cumulative_tokens),
                                 "epoch": float(getattr(self.state, "epoch", 0.0) or 0.0),
-                            })
+                            }
                 except Exception:
                     pass
 
@@ -725,36 +698,63 @@ def main():
             except Exception:
                 return (outputs.loss, outputs) if return_outputs else outputs.loss
 
-    class GradNormCallback(TrainerCallback):
-        def __init__(self, log_every: int = 50):
-            self.log_every = max(1, int(log_every))
+    class SingleLineMetricsCallback(TrainerCallback):
+        def __init__(self, trainer_ref):
+            self.trainer_ref = trainer_ref
+            self._last_grad_norm: Optional[float] = None
 
         def on_step_end(self, args, state, control, **kwargs):
             try:
-                if state.global_step % self.log_every != 0:
-                    return
                 model = kwargs.get("model", None)
-                trainer = kwargs.get("trainer", None)
-                if model is None or trainer is None:
-                    return
-                total_sq = 0.0
+                if model is None and hasattr(self.trainer_ref, "model"):
+                    model = self.trainer_ref.model
+                grad_norm_sq = 0.0
                 any_grad = False
-                for p in model.parameters():
-                    if p.grad is not None:
-                        g = p.grad.data
-                        # Use 2-norm per parameter and accumulate squared norms
-                        val = g.norm(2).item()
-                        total_sq += val * val
-                        any_grad = True
-                grad_norm = (total_sq ** 0.5) if any_grad else 0.0
-                trainer.log({"grad_norm": float(grad_norm)})
+                if model is not None:
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            g = p.grad.data
+                            val = g.norm(2).item()
+                            grad_norm_sq += val * val
+                            any_grad = True
+                grad_norm = (grad_norm_sq ** 0.5) if any_grad else 0.0
+
+                # Prefer DeepSpeed's global grad norm if available
+                try:
+                    ds_engine = getattr(self.trainer_ref, "deepspeed", None)
+                    if ds_engine is not None:
+                        if hasattr(ds_engine, "get_global_grad_norm"):
+                            gn = ds_engine.get_global_grad_norm()
+                            if gn is not None:
+                                grad_norm = float(gn)
+                        elif hasattr(ds_engine, "get_global_norm"):
+                            gn = ds_engine.get_global_norm()
+                            if gn is not None:
+                                grad_norm = float(gn)
+                except Exception:
+                    pass
+
+                self._last_grad_norm = float(grad_norm)
+            except Exception:
+                self._last_grad_norm = None
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            try:
+                if logs is None:
+                    return
+                # Merge last extra metrics computed during compute_loss
+                extra = getattr(self.trainer_ref, "_last_extra_metrics", None)
+                if isinstance(extra, dict):
+                    logs.update(extra)
+                # Add grad_norm captured at step end so it prints on the same line
+                if self._last_grad_norm is not None:
+                    logs["grad_norm"] = self._last_grad_norm
             except Exception:
                 return
 
     _callbacks: List[Any] = []
     if do_eval:
         _callbacks.append(EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience))
-    _callbacks.append(GradNormCallback(log_every=training_args.logging_steps))
 
     trainer = WeightedSFTTrainer(
         model=model,
@@ -766,25 +766,68 @@ def main():
         data_collator=data_collator,
     )
 
+    # Ensure single-line merged metrics at each logging step
+    trainer.add_callback(SingleLineMetricsCallback(trainer))
+
+    # --- Robust checkpoint resume helpers ---
+    def _is_valid_checkpoint_dir(path: str) -> bool:
+        try:
+            if not os.path.isdir(path):
+                return False
+            state_file = os.path.join(path, "trainer_state.json")
+            return os.path.isfile(state_file)
+        except Exception:
+            return False
+
+    def _latest_valid_checkpoint(parent_dir: str) -> Optional[str]:
+        try:
+            cand = [p for p in glob.glob(os.path.join(parent_dir, "checkpoint-*")) if os.path.isdir(p)]
+            cand_sorted = sorted(
+                cand,
+                key=lambda p: int(p.rsplit("-", 1)[-1]) if p.rsplit("-", 1)[-1].isdigit() else -1,
+                reverse=True,
+            )
+            for ck in cand_sorted:
+                if _is_valid_checkpoint_dir(ck):
+                    return ck
+        except Exception:
+            pass
+        return None
+
     # Start training
     try:
         print("Starting training...")
         resume_arg = None
         if args.resume_from_checkpoint:
-            if args.resume_from_checkpoint.strip().lower() == "last":
-                # Find latest checkpoint-* under output_dir
-                ckpts = sorted(glob.glob(os.path.join(args.output_dir, "checkpoint-*")), key=lambda p: int(p.rsplit("-", 1)[-1]) if p.rsplit("-", 1)[-1].isdigit() else -1)
-                if ckpts:
-                    resume_arg = ckpts[-1]
-                    print(f"Resuming from last checkpoint: {resume_arg}")
+            req = args.resume_from_checkpoint.strip()
+            lower = req.lower()
+            chosen = None
+            if lower == "last":
+                chosen = _latest_valid_checkpoint(args.output_dir)
+                if chosen:
+                    print(f"Resuming from last valid checkpoint: {chosen}")
                 else:
-                    print("No checkpoint-* directories found to resume from; starting fresh.")
+                    print("No valid checkpoints (with trainer_state.json) found; starting fresh.")
             else:
-                if os.path.isdir(args.resume_from_checkpoint):
-                    resume_arg = args.resume_from_checkpoint
-                    print(f"Resuming from checkpoint: {resume_arg}")
+                cand = req
+                if os.path.isdir(cand):
+                    # Normalize inner DeepSpeed paths like .../checkpoint-XYZ/global_stepXYZ -> checkpoint-XYZ
+                    base = os.path.basename(cand)
+                    if base.startswith("global_step"):
+                        cand = os.path.dirname(cand)
+                    if _is_valid_checkpoint_dir(cand):
+                        chosen = cand
+                        print(f"Resuming from checkpoint: {chosen}")
+                    else:
+                        prev = _latest_valid_checkpoint(os.path.dirname(cand))
+                        if prev:
+                            print(f"Requested checkpoint missing trainer_state.json. Falling back to previous valid: {prev}")
+                            chosen = prev
+                        else:
+                            print(f"No valid checkpoints found near requested path: {req}. Starting fresh.")
                 else:
-                    print(f"Provided --resume-from-checkpoint does not exist: {args.resume_from_checkpoint}. Starting fresh.")
+                    print(f"Provided --resume-from-checkpoint does not exist: {req}. Starting fresh.")
+            resume_arg = chosen
 
         trainer.train(resume_from_checkpoint=resume_arg)
         print("Training completed successfully!")
