@@ -16,6 +16,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     EarlyStoppingCallback,
+    TrainerCallback,
     TrainingArguments,
     DataCollatorForSeq2Seq,
 )
@@ -593,6 +594,39 @@ def main():
             loss_weights = inputs.pop("loss_weights", None)
             outputs = model(**inputs)
             if loss_weights is None:
+                # Also log extra metrics even when not using weights
+                try:
+                    logits = outputs.get("logits", None)
+                    labels = inputs.get("labels", None)
+                    if logits is not None and labels is not None:
+                        # Compute mean token accuracy, entropy, and cumulative tokens
+                        with torch.no_grad():
+                            shift_logits = logits[..., :-1, :].contiguous()
+                            shift_labels = labels[..., 1:].contiguous()
+
+                            valid_mask = (shift_labels != -100)
+                            if valid_mask.any():
+                                # Accuracy
+                                pred_tokens = shift_logits.argmax(dim=-1)
+                                correct = (pred_tokens == shift_labels) & valid_mask
+                                mean_acc = (correct.sum().float() / valid_mask.sum().float()).item()
+                                # Entropy
+                                log_probs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
+                                probs = torch.exp(log_probs)
+                                ent = (-probs * log_probs).sum(dim=-1)
+                                mean_ent = ent[valid_mask].mean().item()
+                                # Cumulative token counter
+                                if not hasattr(self, "_cumulative_tokens"):
+                                    self._cumulative_tokens = 0.0
+                                self._cumulative_tokens += float(valid_mask.sum().item())
+                                self.log({
+                                    "mean_token_accuracy": mean_acc,
+                                    "entropy": mean_ent,
+                                    "num_tokens": float(self._cumulative_tokens),
+                                    "epoch": float(getattr(self.state, "epoch", 0.0) or 0.0),
+                                })
+                except Exception:
+                    pass
                 return (outputs.loss, outputs) if return_outputs else outputs.loss
 
             try:
@@ -663,9 +697,64 @@ def main():
                 sum_weights = flat_weights[valid_mask].sum()
                 loss = sum_weighted / torch.clamp(sum_weights, min=1.0)
 
+                # Extra metrics: accuracy, entropy, cumulative tokens
+                try:
+                    with torch.no_grad():
+                        valid_mask = (shift_labels != -100)
+                        if valid_mask.any():
+                            pred_tokens = shift_logits.argmax(dim=-1)
+                            correct = (pred_tokens == shift_labels) & valid_mask
+                            mean_acc = (correct.sum().float() / valid_mask.sum().float()).item()
+                            log_probs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
+                            probs = torch.exp(log_probs)
+                            ent = (-probs * log_probs).sum(dim=-1)
+                            mean_ent = ent[valid_mask].mean().item()
+                            if not hasattr(self, "_cumulative_tokens"):
+                                self._cumulative_tokens = 0.0
+                            self._cumulative_tokens += float(valid_mask.sum().item())
+                            self.log({
+                                "mean_token_accuracy": mean_acc,
+                                "entropy": mean_ent,
+                                "num_tokens": float(self._cumulative_tokens),
+                                "epoch": float(getattr(self.state, "epoch", 0.0) or 0.0),
+                            })
+                except Exception:
+                    pass
+
                 return (loss, outputs) if return_outputs else loss
             except Exception:
                 return (outputs.loss, outputs) if return_outputs else outputs.loss
+
+    class GradNormCallback(TrainerCallback):
+        def __init__(self, log_every: int = 50):
+            self.log_every = max(1, int(log_every))
+
+        def on_step_end(self, args, state, control, **kwargs):
+            try:
+                if state.global_step % self.log_every != 0:
+                    return
+                model = kwargs.get("model", None)
+                trainer = kwargs.get("trainer", None)
+                if model is None or trainer is None:
+                    return
+                total_sq = 0.0
+                any_grad = False
+                for p in model.parameters():
+                    if p.grad is not None:
+                        g = p.grad.data
+                        # Use 2-norm per parameter and accumulate squared norms
+                        val = g.norm(2).item()
+                        total_sq += val * val
+                        any_grad = True
+                grad_norm = (total_sq ** 0.5) if any_grad else 0.0
+                trainer.log({"grad_norm": float(grad_norm)})
+            except Exception:
+                return
+
+    _callbacks: List[Any] = []
+    if do_eval:
+        _callbacks.append(EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience))
+    _callbacks.append(GradNormCallback(log_every=training_args.logging_steps))
 
     trainer = WeightedSFTTrainer(
         model=model,
@@ -673,7 +762,7 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         peft_config=None,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience)] if do_eval else None,
+        callbacks=_callbacks,
         data_collator=data_collator,
     )
 
