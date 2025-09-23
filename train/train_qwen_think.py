@@ -536,7 +536,7 @@ def main():
     except Exception:
         world_size = 1
     updates_per_epoch = max(1, math.ceil(len(train_dataset) / (args.per_device_train_batch_size * world_size * args.gradient_accumulation_steps)))
-    save_steps_calc = max(1, updates_per_epoch * 2)  # every 1 epochs
+    save_steps_calc = max(1, updates_per_epoch * 1)  # every 1 epochs
     log_steps_calc = max(1, updates_per_epoch // 4)  # ~ every 0.25 epoch
 
     # Build TrainingArguments with compatibility across Transformers versions
@@ -567,7 +567,7 @@ def main():
         report_to=args.report_to,
         remove_unused_columns=False,
         dataloader_pin_memory=False,
-        max_grad_norm=0.5, # curb exploding updates that drive verbosity and repetition
+        max_grad_norm=1.0, # curb exploding updates that drive verbosity and repetition
     )
     if strategy_key is not None:
         ta_kwargs[strategy_key] = eval_strategy_value
@@ -674,7 +674,6 @@ def main():
         eval_dataset=eval_dataset,
         peft_config=None,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience)] if do_eval else None,
-        max_seq_length=args.max_seq_length,
         data_collator=data_collator,
     )
 
