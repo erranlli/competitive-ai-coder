@@ -490,7 +490,7 @@ def main():
     # Loss re-weighting for code vs non-code tokens
     p.add_argument("--enable-loss-reweight", action="store_true", default=False, help="Enable per-token loss re-weighting (code vs non-code)")
     p.add_argument("--loss-weight-code", type=float, default=2.0, help="Loss weight for code tokens inside ```python blocks")
-    p.add_argument("--loss-weight-noncode", type=float, default=0.2, help="Loss weight for non-code assistant tokens")
+    p.add_argument("--loss-weight-noncode", type=float, default=0.5, help="Loss weight for non-code assistant tokens")
     p.add_argument("--mask-noncode", action="store_true", default=False, help="If set, non-code assistant tokens are masked from loss entirely")
     
     args = p.parse_args()
@@ -536,8 +536,8 @@ def main():
     except Exception:
         world_size = 1
     updates_per_epoch = max(1, math.ceil(len(train_dataset) / (args.per_device_train_batch_size * world_size * args.gradient_accumulation_steps)))
-    save_steps_calc = max(1, updates_per_epoch * 1)  # every 1 epochs
-    log_steps_calc = max(1, updates_per_epoch // 2)  # ~ every 0.5 epoch
+    save_steps_calc = max(1, updates_per_epoch * 2)  # every 1 epochs
+    log_steps_calc = max(1, updates_per_epoch // 4)  # ~ every 0.25 epoch
 
     # Build TrainingArguments with compatibility across Transformers versions
     ta_fields = getattr(TrainingArguments, "__dataclass_fields__", {})

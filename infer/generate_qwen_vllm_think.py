@@ -97,7 +97,6 @@ def build_prompt_from_row(
     row: Dict[str, Any], 
     enable_thinking: bool = True,
     model_name: str = "",
-    explicit_thinking: bool = False,
     use_livecodebench_style: bool = False
 ) -> str:
     """
@@ -107,7 +106,6 @@ def build_prompt_from_row(
         row: Dictionary containing problem data
         enable_thinking: Whether thinking is enabled globally
         model_name: Model name for type detection
-        explicit_thinking: Whether to add explicit thinking instructions
         use_livecodebench_style: Whether to use LiveCodeBench-style formatting
     """
     # Extract problem components
@@ -239,7 +237,6 @@ class GenConfig:
     max_problems: int
     gpu_memory_utilization: float
     enable_thinking: bool
-    explicit_thinking: bool
     use_livecodebench_style: bool  # New parameter
     # Decoding controls
     no_repeat_ngram_size: int = 6
@@ -313,10 +310,7 @@ def generate_with_vllm(cfg: GenConfig) -> str:
     model_type = detect_model_type(cfg.model_name)
     print(f"Model type detected: {model_type}")
     print(f"Thinking enabled: {cfg.enable_thinking}")
-    print(f"Explicit thinking instructions: {cfg.explicit_thinking}")
     print(f"LiveCodeBench style: {cfg.use_livecodebench_style}")
-    if cfg.explicit_thinking and model_type == "deepseek-r1":
-        print("Note: Explicit thinking disabled for DeepSeek-R1 (has built-in reasoning)")
 
     if cfg.gpu_ids:
         os.environ["CUDA_VISIBLE_DEVICES"] = cfg.gpu_ids
@@ -363,6 +357,10 @@ def generate_with_vllm(cfg: GenConfig) -> str:
                     except Exception: pass
         return copied
 
+#
+# ... (all the code before prepare_model_dir)
+#
+
     def prepare_model_dir() -> str:
         # 1) No checkpoint_path: return model_name
         if not cfg.checkpoint_path or not os.path.exists(cfg.checkpoint_path):
@@ -385,6 +383,18 @@ def generate_with_vllm(cfg: GenConfig) -> str:
             try:
                 print(f"Auto-converting DeepSpeed checkpoint: {path} -> {out_file}")
                 ds_convert(path, out_file)
+                
+                # FIXED BLOCK: START
+                # If ds_convert creates a directory for sharded weights, normalize the structure.
+                if os.path.isdir(out_file):
+                    print(f"Normalizing sharded checkpoint structure created at: {out_file}")
+                    # Move all files from the subdirectory (e.g., index, shards) to the parent tmpdir
+                    for item in os.listdir(out_file):
+                        shutil.move(os.path.join(out_file, item), os.path.join(tmpdir, item))
+                    # Remove the now-empty, problematic directory
+                    os.rmdir(out_file)
+                # FIXED BLOCK: END
+
                 # Save tokenizer and config alongside for completeness
                 try:
                     tok = AutoTokenizer.from_pretrained(cfg.model_name, trust_remote_code=True)
@@ -397,6 +407,7 @@ def generate_with_vllm(cfg: GenConfig) -> str:
                 return tmpdir
             except Exception as e:
                 print(f"Auto-convert failed: {e}")
+                shutil.rmtree(tmpdir) # Clean up temp directory on failure
                 return cfg.model_name
 
         # If directory already has a single-file weight or nested bug, normalize
@@ -431,6 +442,8 @@ def generate_with_vllm(cfg: GenConfig) -> str:
 
         # Otherwise fall back to model_name
         return cfg.model_name
+
+    # (removed unused duplicate prepare_model_dir0 and stray code)
 
     model_to_use = prepare_model_dir()
     print(f"Using model: {model_to_use}")
@@ -506,8 +519,7 @@ def generate_with_vllm(cfg: GenConfig) -> str:
                 build_prompt_from_row(
                     row, 
                     cfg.enable_thinking, 
-                    cfg.model_name, 
-                    cfg.explicit_thinking,
+                    cfg.model_name,
                     cfg.use_livecodebench_style
                 ), 
                 cfg.enable_thinking
@@ -562,7 +574,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=0)
     
     p.add_argument("--enable-thinking", action="store_true", help="Enable thinking mode with <think> tags")
-    p.add_argument("--explicit-thinking", action="store_true", help="Add explicit step-by-step thinking instructions to prompts")
     p.add_argument("--use-livecodebench-style", action="store_true", help="Use LiveCodeBench-style prompt formatting")
     
     p.add_argument("--gpu-ids", default="0,1,2,3,4,5,6,7")
@@ -573,7 +584,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-non-stdio", action=argparse.BooleanOptionalAction, default=True)
     
     # Default: disable thinking to reduce verbosity for instruction-tuned code models
-    p.set_defaults(enable_thinking=False, explicit_thinking=False, use_livecodebench_style=False)
+    p.set_defaults(enable_thinking=False, use_livecodebench_style=False)
     return p
 
 
