@@ -538,7 +538,7 @@ def main():
         world_size = 1
     updates_per_epoch = max(1, math.ceil(len(train_dataset) / (args.per_device_train_batch_size * world_size * args.gradient_accumulation_steps)))
     save_steps_calc = max(1, updates_per_epoch * 1)  # every 1 epochs
-    log_steps_calc = max(1, updates_per_epoch // 4)  # ~ every 0.25 epoch
+    log_steps_calc = max(1, updates_per_epoch // 20)  # ~ every 0.05 epoch
 
     # Build TrainingArguments with compatibility across Transformers versions
     ta_fields = getattr(TrainingArguments, "__dataclass_fields__", {})
