@@ -19,7 +19,7 @@ from transformers import (
     TrainingArguments,
     DataCollatorForSeq2Seq,
 )
-from peft import LoraConfig, PeftModel
+from peft import LoraConfig
 from trl import SFTTrainer
 import numpy as np
 import re
@@ -187,103 +187,6 @@ from peft import PeftModel
 def is_main_process():
     return int(os.environ.get("LOCAL_RANK", "0")) == 0
 
-def merge_and_eval_adapter(adapter_dir: str, base_model_name: str, tokenizer, eval_prompts: List[str], eval_refs: List[str], out_prefix: str):
-    """
-    adapter_dir: path where LoRA adapter (Peft) is saved
-    base_model_name: original HF model id (e.g. Qwen/Qwen2.5-7B-Instruct)
-    tokenizer: tokenizer instance (padding_side already set)
-    eval_prompts / eval_refs: lists extracted from eval dataset (strings)
-    out_prefix: prefix for merged model directory
-    """
-
-    if not is_main_process():
-        print("Not main process; skipping merge/eval.")
-        return
-
-    # If adapter_folder looks like a deepspeed consolidated checkpoint, abort and explain
-    # A PEFT adapter saved via trainer.save_model should contain adapter_config.json and pytorch_model.bin or adapter_model.bin
-    # but DeepSpeed Zero-3 consolidated checkpoint folders can look different.
-    adapter_files = os.listdir(adapter_dir)
-    # quick check
-    if any(f.startswith("global_step") or f.endswith(".pt") for f in adapter_files) and "adapter_config.json" not in adapter_files:
-        print("ERROR: the adapter directory looks like a DeepSpeed ZeRO-3 checkpoint or a non-PEFT folder.")
-        print("If you trained with DeepSpeed ZeRO-3, please run the DeepSpeed zero_to_fp32 conversion (see instructions).")
-        print("Alternatively, ensure you saved the adapter via `trainer.save_model(adapter_dir)` which writes a PEFT adapter layout.")
-        raise RuntimeError("Adapter directory not in PEFT format. Cannot merge safely.")
-
-    print(f"Loading clean base model from hub: {base_model_name} (cpu, fp32) for merging...")
-    # Load the *original* base model from the hub (not any ds checkpoint) — load on CPU to avoid memory pressure.
-    base_model = AutoModelForCausalLM.from_pretrained(
-        base_model_name,
-        torch_dtype=torch.float32,
-        trust_remote_code=True,
-        low_cpu_mem_usage=True,
-    )
-
-    print("Loading PEFT adapter into base model...")
-    peft_loaded = PeftModel.from_pretrained(base_model, adapter_dir, is_trainable=False)
-
-    # find missing keys (PEFT prints some warnings, but we check explicitly)
-    # `peft_loaded` has merged params but we can inspect expected vs found keys using its state_dict
-    adapter_state = {}
-    try:
-        adapter_state = peft_loaded.peft_config.__dict__  # placeholder; we mostly rely on PeftModel errors below
-    except Exception:
-        pass
-
-    # Merge and unload: this will create the merged weights in memory
-    print("Merging adapter weights into the base model (this may take a while)...")
-    try:
-        merged = peft_loaded.merge_and_unload()
-    except Exception as e:
-        print("ERROR during merge_and_unload(). This may happen if the adapter doesn't match the base model.")
-        raise
-
-    merged_model_path = f"{out_prefix}-merged"
-    print(f"Saving merged model to: {merged_model_path}")
-    merged.save_pretrained(merged_model_path, safe_serialization=True)
-    tokenizer.save_pretrained(merged_model_path)
-    print("Merged model saved.")
-
-    # Move merged model to GPU for evaluation if available
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Loading merged model to {device} for evaluation...")
-    merged_for_eval = AutoModelForCausalLM.from_pretrained(merged_model_path, trust_remote_code=True, torch_dtype=torch.bfloat16).to(device)
-    merged_for_eval.eval()
-
-    # Greedy generation/eval (small batches)
-    print("Running greedy generation for PASS@1 evaluation...")
-    batch_size = 2
-    gens = []
-    for i in range(0, len(eval_prompts), batch_size):
-        batch = eval_prompts[i:i+batch_size]
-        enc = tokenizer(batch, return_tensors="pt", padding=True, truncation=True, add_special_tokens=False).to(device)
-        with torch.no_grad():
-            out = merged_for_eval.generate(
-                **enc,
-                max_new_tokens=512,
-                do_sample=False,
-                temperature=0.0,
-                eos_token_id=tokenizer.eos_token_id,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-        for seq in out:
-            gens.append(tokenizer.decode(seq, skip_special_tokens=True))
-    # basic normalized string match metric (you can replace with judge-run)
-    def normalize(s):
-        import re
-        s = s.strip()
-        s = re.sub(r'\r\n', '\n', s)
-        s = re.sub(r'\s+\n', '\n', s)
-        return s
-    correct = 0
-    for ref, gen in zip(eval_refs, gens):
-        if normalize(ref) == normalize(gen) or normalize(ref) in normalize(gen):
-            correct += 1
-    pass1 = correct / max(1, len(eval_prompts))
-    print(f"PASS@1 (normalized-string-match) = {pass1*100:.2f}%")
-
-    return merged_model_path
 
 def check_environment():
     print("=== Environment Check ===")
@@ -405,7 +308,7 @@ def main():
     p.add_argument("--warmup-ratio", type=float, default=0.03)
     p.add_argument("--eval-steps", type=int, default=2000)
     p.add_argument("--save-steps", type=int, default=400)
-    p.add_argument("--logging-steps", type=int, default=20)
+    p.add_argument("--logging-steps", type=int, default=50)
     p.add_argument("--validation-split-percentage", type=int, default=5)
     p.add_argument("--early-stopping-patience", type=int, default=3)
     p.add_argument("--use-lora", action="store_true", default=False) #Turn Lora off
