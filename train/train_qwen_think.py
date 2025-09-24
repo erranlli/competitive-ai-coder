@@ -31,7 +31,8 @@ from transformers import (
 from model_util.model_util import load_tokenizer
 from model_util.file_util import ensure_dir, latest_valid_trainer_checkpoint
 from model_util.train_util import (
-    enforce_strict_and_length,
+    enforce_strict_format,
+    enforce_length_only,
     get_map_and_tokenize_row,
     SingleLineMetricsCallback,
 )
@@ -64,6 +65,7 @@ def load_and_format_dataset(
     tokenizer: AutoTokenizer,
     validation_split_percentage: int,
     max_seq_length: int,
+    enforce_format: bool = False,
     max_samples: int = 0,
     single_arrow_file: Optional[str] = None,
     use_first_arrow_in_dir: bool = False,
@@ -111,8 +113,12 @@ def load_and_format_dataset(
 
     print(f"Dataset split into {len(train_ds)} training samples and {len(eval_ds)} evaluation samples.")
 
-    train_ds = enforce_strict_and_length(train_ds, tokenizer, max_seq_length, 'train')
-    eval_ds = enforce_strict_and_length(eval_ds, tokenizer, max_seq_length, 'eval')
+    # Always enforce length; optionally enforce strict structure/pattern
+    train_ds = enforce_length_only(train_ds, tokenizer, max_seq_length, 'train')
+    eval_ds = enforce_length_only(eval_ds, tokenizer, max_seq_length, 'eval')
+    if enforce_format:
+        train_ds = enforce_strict_format(train_ds, tokenizer, max_seq_length, 'train')
+        eval_ds = enforce_strict_format(eval_ds, tokenizer, max_seq_length, 'eval')
 
 
     map_and_tokenize_row = get_map_and_tokenize_row(
@@ -288,12 +294,13 @@ def main():
     p.add_argument("--wandb-project", default=None, help="(optional) wandb project name to report to")
     p.add_argument("--disable-training-eval", action="store_true", default=True, help="Disable Trainer evaluation during training to save time")
     p.add_argument("--single-arrow-file", type=str, default=None, help="Path to a single Arrow shard to load instead of the full dataset")
+    p.add_argument("--enforce-format", action="store_true", default=False, help="If set, enforce strict message/format and length filters on the dataset")
     p.add_argument("--use-first-arrow-in-dir", action="store_true", default=False, help="If set, load the first data-*.arrow file under the dataset dir")
     p.add_argument("--resume-from-checkpoint", type=str, default=None, help="Path to a checkpoint dir to resume from (e.g., output_dir/checkpoint-123 or 'last')")
     # Loss re-weighting for code vs non-code tokens
     p.add_argument("--enable-loss-reweight", action="store_true", default=False, help="Enable per-token loss re-weighting (code vs non-code)")
-    p.add_argument("--loss-weight-code", type=float, default=2.0, help="Loss weight for code tokens inside ```python blocks")
-    p.add_argument("--loss-weight-noncode", type=float, default=0.5, help="Loss weight for non-code assistant tokens")
+    p.add_argument("--loss-weight-code", type=float, default=1.0, help="Loss weight for code tokens inside ```python blocks")
+    p.add_argument("--loss-weight-noncode", type=float, default=1.0, help="Loss weight for non-code assistant tokens")
     p.add_argument("--mask-noncode", action="store_true", default=False, help="If set, non-code assistant tokens are masked from loss entirely")
     
     args = p.parse_args()
@@ -309,7 +316,7 @@ def main():
     print("Loading and formatting dataset...")
     train_dataset, eval_dataset = load_and_format_dataset(
         args.dataset_path, tokenizer, args.validation_split_percentage,
-        max_seq_length=args.max_seq_length, max_samples=args.max_train_samples,
+        max_seq_length=args.max_seq_length, enforce_format=args.enforce_format, max_samples=args.max_train_samples,
         single_arrow_file=args.single_arrow_file, use_first_arrow_in_dir=args.use_first_arrow_in_dir,
         enable_loss_reweight=args.enable_loss_reweight,
         loss_weight_code=args.loss_weight_code,
@@ -393,7 +400,15 @@ def main():
             if loss_weights is None:
                 # Compute and stash extra metrics; merge at on_log for single-line printing
                 try:
-                    logits = outputs.get("logits", None)
+                    # Robustly get logits across different ModelOutput types
+                    logits = None
+                    try:
+                        logits = outputs.logits  # prefer attribute access
+                    except Exception:
+                        pass
+                    if logits is None and isinstance(outputs, dict):
+                        logits = outputs.get("logits", None)
+
                     labels = inputs.get("labels", None)
                     if logits is not None and labels is not None:
                         with torch.no_grad():
@@ -422,7 +437,15 @@ def main():
                 return (outputs.loss, outputs) if return_outputs else outputs.loss
 
             try:
-                logits = outputs.get("logits", None)
+                # Robustly get logits across different ModelOutput types
+                logits = None
+                try:
+                    logits = outputs.logits
+                except Exception:
+                    pass
+                if logits is None and isinstance(outputs, dict):
+                    logits = outputs.get("logits", None)
+
                 labels = inputs.get("labels", None)
                 if logits is None or labels is None:
                     return (outputs.loss, outputs) if return_outputs else outputs.loss
