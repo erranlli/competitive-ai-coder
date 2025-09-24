@@ -307,8 +307,9 @@ def main():
     p.add_argument("--num-train-epochs", type=float, default=3.0)
     p.add_argument("--warmup-ratio", type=float, default=0.03)
     p.add_argument("--eval-steps", type=int, default=2000)
-    p.add_argument("--save-steps", type=int, default=400)
-    p.add_argument("--logging-steps", type=int, default=50)
+    p.add_argument("--save-strategy", type=str, default="epoch", choices=["steps", "epoch"], help="The checkpoint save strategy to use ('steps' or 'epoch').")
+    p.add_argument("--save-steps", type=int, default=0, help="Number of updates steps before two checkpoint saves if save_strategy='steps'. If 0, will default to every epoch.")
+    p.add_argument("--logging-steps", type=int, default=20)
     p.add_argument("--validation-split-percentage", type=int, default=5)
     p.add_argument("--early-stopping-patience", type=int, default=3)
     p.add_argument("--use-lora", action="store_true", default=False) #Turn Lora off
@@ -364,13 +365,19 @@ def main():
     # TrainingArguments tuned for stable fine-tune
     do_eval = not args.disable_training_eval
     eval_strategy_value = "steps" if do_eval else "no"
-    load_best_value = True if do_eval else False
+    #load_best_value = True if do_eval else False
+    if args.save_strategy == "epoch" and args.save_steps == 0:
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        updates_per_epoch = math.ceil(len(train_dataset) / (args.per_device_train_batch_size * world_size * args.gradient_accumulation_steps))
+        save_steps_val = updates_per_epoch
+        print(f"Save strategy is 'epoch', will save every {save_steps_val} steps.")
+
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         deepspeed=args.deepspeed if int(os.environ.get("WORLD_SIZE", "1")) > 1 else None,
         bf16=True, do_train=True, do_eval=do_eval,
         eval_strategy=eval_strategy_value, eval_steps=args.eval_steps,
-        save_strategy="steps", save_steps=args.save_steps,
+        save_strategy=args.save_strategy, save_steps=args.save_steps,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         gradient_checkpointing=True,
