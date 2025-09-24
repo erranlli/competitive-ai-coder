@@ -2,6 +2,7 @@
 # improved_finetune_qwen_codeforces.py
 import argparse
 import os
+import sys
 import gc
 import math
 import json
@@ -12,17 +13,26 @@ from deepspeed.utils.zero_to_fp32 import convert_zero_checkpoint_to_fp32_state_d
 
 import torch
 from datasets import load_from_disk, Dataset
-from transformers import (
+\n+# Ensure repository root is on sys.path for local package imports
+_CUR_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.abspath(os.path.join(_CUR_DIR, ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+\n+from transformers import (
     AutoModelForCausalLM,
-    AutoTokenizer,
     EarlyStoppingCallback,
     TrainerCallback,
     TrainingArguments,
     DataCollatorForSeq2Seq,
 )
+from model_util.model_util import load_tokenizer
+from model_util.file_util import ensure_dir, latest_valid_trainer_checkpoint
+from model_util.train_util import (
+    enforce_strict_and_length,
+    get_map_and_tokenize_row,
+    SingleLineMetricsCallback,
+)
 from trl import SFTTrainer
-import numpy as np
-import re
 from tqdm import tqdm
 
 # disable problematic deepspeed optimizations sometimes used on some infra
@@ -30,22 +40,6 @@ os.environ["DEEPSPEED_DISABLE_ZEROFLOW"] = "1"
 
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
-
-# --- Utilities to build messages / extract solution ---
-def build_messages_from_row(row: Dict[str, Any]) -> List[Dict[str, str]]:
-    if isinstance(row.get("messages"), list) and row["messages"]:
-        msgs = []
-        for m in row["messages"]:
-            role = m.get("role") or m.get("from") or "user"
-            content = m.get("content") or m.get("value") or ""
-            if content is None: content = ""
-            msgs.append({"role": role, "content": str(content)})
-        return msgs
-    # fallback: try common fields
-    if "input" in row and "output" in row:
-        return [{"role": "user", "content": str(row["input"])},
-                {"role": "assistant", "content": str(row["output"])}]
-    return []
 
 
 def apply_chat_template(tokenizer: AutoTokenizer, messages: List[Dict[str, str]]) -> str:
@@ -114,191 +108,18 @@ def load_and_format_dataset(
 
     print(f"Dataset split into {len(train_ds)} training samples and {len(eval_ds)} evaluation samples.")
 
-    # --- Enforce strict formatting and normalize constraints ---
-    def _extract_messages(row: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
-        msgs = build_messages_from_row(row)
-        if not (len(msgs) == 2 and msgs[0]['role'] == 'user' and msgs[1]['role'] == 'assistant'):
-            return None, None
-        return str(msgs[0]['content'] or ''), str(msgs[1]['content'] or '')
+    train_ds = enforce_strict_and_length(train_ds, tokenizer, max_seq_length, 'train')
+    eval_ds = enforce_strict_and_length(eval_ds, tokenizer, max_seq_length, 'eval')
 
 
-    # This pattern is based on the previous "flexible_pattern"
-    strict_pattern = re.compile(
-        # The string must start here, with optional whitespace
-        r"^\s*"
-        
-        # 1. A required <think> block
-        r"<think>[\s\S]+?</think>"
-        
-        # 2. FLEXIBLE SEPARATOR: Allow any characters between sections
-        r"[\s\S]*?"
-        
-        # 3. A required 'Approach' section
-        r"###\s*Approach"
-        r"[\s\S]+?"
-        
-        # 4. An OPTIONAL 'Solution Code' header.
-        # The non-capturing group (?:...) combined with the ? quantifier
-        # makes this entire sub-pattern optional (matches zero or one time).
-        r"(?:###\s*Solution Code\s*)?"
-        
-        # 5. A required python code block
-        r"```python[\r\n]+"
-        r"[\s\S]+?"
-        r"```"
-        
-        # 6. FLEXIBLE SEPARATOR: Allow any characters before the explanation
-        r"[\s\S]*?"
-        r"###\s*Explanation"
-        r"[\s\S]*"
-        
-        # The string must end here
-        r"\Z",
-        
-        # Flag to make the pattern case-insensitive
-        re.IGNORECASE,
+    map_and_tokenize_row = get_map_and_tokenize_row(
+        tokenizer,
+        max_seq_length,
+        enable_loss_reweight,
+        loss_weight_code,
+        loss_weight_noncode,
+        mask_noncode,
     )
-
-    def _enforce_on_split(ds_in: Dataset, split_name: str) -> Dataset:
-        invalid = 0
-        too_long = 0
-        accepted: List[Dict[str, Any]] = []
-        for row in ds_in:
-            user_text, assistant_text = _extract_messages(row)
-            if user_text is None or assistant_text is None:
-                invalid += 1
-                rid = row.get('id') or f"{row.get('contest_id','')}/{row.get('index','')}"
-                print(f"[STRICT] {split_name} invalid (bad message shape) id={rid}")
-                continue
-            # Add default constraints if missing: insert immediately after Problem and before Input Format
-            if '## Constraints' not in user_text:
-                constraints_block = "\n\n## Constraints\nTime limit per test: 2.0 seconds\nMemory limit per test: 256.0 megabytes"
-                m_input = re.search(r'(^|\n)##\s*Input\s*Format', user_text, re.IGNORECASE)
-                if m_input:
-                    user_text = user_text[:m_input.start()] + constraints_block + user_text[m_input.start():]
-                else:
-                    m_problem = re.search(r'(^|\n)#\s*Problem[^\n]*\n', user_text, re.IGNORECASE)
-                    if m_problem:
-                        insert_pos = m_problem.end()
-                        user_text = user_text[:insert_pos] + constraints_block + user_text[insert_pos:]
-                    else:
-                        user_text = user_text.strip() + constraints_block
-            # Validate assistant formatting
-            if not strict_pattern.search(assistant_text):
-                invalid += 1
-                rid = row.get('id') or f"{row.get('contest_id','')}/{row.get('index','')}"
-                print(f"[STRICT] {split_name} invalid format id={rid}")
-                try:
-                    print((assistant_text or '')[:400])
-                except Exception:
-                    pass
-                continue
-            # Token length filter: combined user + assistant under max_seq_length
-            messages_pair = [
-                {'role': 'user', 'content': user_text},
-                {'role': 'assistant', 'content': assistant_text},
-            ]
-            try:
-                full_text = tokenizer.apply_chat_template(messages_pair, tokenize=False, add_generation_prompt=False)
-                tok = tokenizer(full_text, add_special_tokens=False)
-                total_tokens = len(tok.get('input_ids', []))
-            except Exception:
-                total_tokens = 10**9  # force skip on tokenizer error
-            if total_tokens > max_seq_length:
-                too_long += 1
-                rid = row.get('id') or f"{row.get('contest_id','')}/{row.get('index','')}"
-                print(f"[LENGTH] {split_name} skip id={rid} tokens={total_tokens} > limit={max_seq_length}")
-                continue
-
-            # Write back normalized fields
-            new_row = dict(row)
-            if 'messages' in row and isinstance(row['messages'], list):
-                new_row['messages'] = messages_pair
-            else:
-                # fallback to input/output
-                new_row['input'] = user_text
-                new_row['output'] = assistant_text
-            accepted.append(new_row)
-        print(f"[STRICT] {split_name} rejected {invalid} samples; [LENGTH] skipped {too_long}; kept {len(accepted)}")
-        return Dataset.from_list(accepted) if accepted else Dataset.from_list([])
-
-    train_ds = _enforce_on_split(train_ds, 'train')
-    eval_ds = _enforce_on_split(eval_ds, 'eval')
-
-
-    def map_and_tokenize_row(row: Dict[str, Any]) -> Dict[str, Any]:
-        messages = build_messages_from_row(row)
-        
-        if not (len(messages) == 2 and messages[0]['role'] == 'user' and messages[1]['role'] == 'assistant'):
-            return {"input_ids": [], "labels": []}
-
-        # --- Step 1: Get prompt text to calculate its length ---
-        prompt_text = tokenizer.apply_chat_template(
-            [messages[0]],
-            tokenize=False, 
-            add_generation_prompt=True
-        )
-        prompt_length = len(tokenizer(prompt_text, add_special_tokens=False)['input_ids'])
-
-        # --- Step 2: Get the FULL text for a single, unified tokenization ---
-        full_text = tokenizer.apply_chat_template(
-            messages, 
-            tokenize=False, 
-            add_generation_prompt=False
-        )
-
-        # --- Step 3: Perform the SINGLE, DEFINITIVE tokenization ---
-        # We ask for offset_mapping to link tokens back to characters
-        tokenized = tokenizer(
-            full_text,
-            truncation=True,
-            padding=False,
-            max_length=max_seq_length,
-            add_special_tokens=False,
-            return_offsets_mapping=True, # <-- CRITICAL
-        )
-        input_ids = tokenized["input_ids"]
-        offsets = tokenized.pop("offset_mapping") # Pop it so it's not passed to the model
-
-        # --- Step 4: Create labels and mask the prompt ---
-        labels = list(input_ids) # Use list() for mutability
-        labels[:prompt_length] = [-100] * prompt_length
-        tokenized["labels"] = labels
-
-        # --- Step 5: (Optional) Calculate and apply loss weights ---
-        if enable_loss_reweight:
-            # Find character spans of the code *within the full_text*
-            assistant_start_char = len(prompt_text) # The assistant response starts after the prompt
-            
-            code_spans: List[Tuple[int, int]] = []
-            # We search in the full_text, not the isolated assistant text
-            for m in re.finditer(r"```python\s*[\r_n]+([\s\S]+?)```", full_text, re.IGNORECASE):
-                # We only care about the inner content of the code block for weighting
-                start_char = m.start(1)
-                end_char = m.end(1)
-                code_spans.append((start_char, end_char))
-
-            # Create weights based on the character offsets of our SINGLE tokenization
-            weights = [loss_weight_noncode] * len(input_ids)
-            for i, (start_char_offset, end_char_offset) in enumerate(offsets):
-                # Check if the token's character span overlaps with any code block span
-                is_code_token = False
-                for code_start, code_end in code_spans:
-                    # A token is a "code token" if it has any overlap with a code span
-                    if max(start_char_offset, code_start) < min(end_char_offset, code_end):
-                        is_code_token = True
-                        break
-                
-                if is_code_token:
-                    weights[i] = loss_weight_code
-
-            # Mask out the prompt tokens from the weights
-            for i in range(min(prompt_length, len(weights))):
-                weights[i] = 0.0
-                
-            tokenized["loss_weights"] = weights
-
-        return tokenized
 
 
     num_proc = min(os.cpu_count() - 2, 8) if os.cpu_count() > 4 else 1
@@ -480,11 +301,7 @@ def main():
     ensure_dir(args.output_dir)
 
     print("Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    # IMPORTANT: decoder-only models require left padding for correct generation
-    tokenizer.padding_side = "left"
+    tokenizer = load_tokenizer(args.model_name)
 
     print("Loading and formatting dataset...")
     train_dataset, eval_dataset = load_and_format_dataset(
@@ -503,7 +320,6 @@ def main():
         dtype=torch.bfloat16, use_cache=False, attn_implementation="flash_attention_2"
     )
 
-    # (Removed LoRA/PEFT configuration)
 
     # TrainingArguments tuned for stable fine-tune
     do_eval = not args.disable_training_eval
@@ -769,41 +585,15 @@ def main():
     # Ensure single-line merged metrics at each logging step
     trainer.add_callback(SingleLineMetricsCallback(trainer))
 
-    # --- Robust checkpoint resume helpers ---
-    def _is_valid_checkpoint_dir(path: str) -> bool:
-        try:
-            if not os.path.isdir(path):
-                return False
-            state_file = os.path.join(path, "trainer_state.json")
-            return os.path.isfile(state_file)
-        except Exception:
-            return False
-
-    def _latest_valid_checkpoint(parent_dir: str) -> Optional[str]:
-        try:
-            cand = [p for p in glob.glob(os.path.join(parent_dir, "checkpoint-*")) if os.path.isdir(p)]
-            cand_sorted = sorted(
-                cand,
-                key=lambda p: int(p.rsplit("-", 1)[-1]) if p.rsplit("-", 1)[-1].isdigit() else -1,
-                reverse=True,
-            )
-            for ck in cand_sorted:
-                if _is_valid_checkpoint_dir(ck):
-                    return ck
-        except Exception:
-            pass
-        return None
-
     # Start training
     try:
         print("Starting training...")
         resume_arg = None
         if args.resume_from_checkpoint:
             req = args.resume_from_checkpoint.strip()
-            lower = req.lower()
             chosen = None
-            if lower == "last":
-                chosen = _latest_valid_checkpoint(args.output_dir)
+            if req.lower() == "last":
+                chosen = latest_valid_trainer_checkpoint(args.output_dir)
                 if chosen:
                     print(f"Resuming from last valid checkpoint: {chosen}")
                 else:
@@ -811,15 +601,14 @@ def main():
             else:
                 cand = req
                 if os.path.isdir(cand):
-                    # Normalize inner DeepSpeed paths like .../checkpoint-XYZ/global_stepXYZ -> checkpoint-XYZ
                     base = os.path.basename(cand)
                     if base.startswith("global_step"):
                         cand = os.path.dirname(cand)
-                    if _is_valid_checkpoint_dir(cand):
+                    if os.path.isfile(os.path.join(cand, "trainer_state.json")):
                         chosen = cand
                         print(f"Resuming from checkpoint: {chosen}")
                     else:
-                        prev = _latest_valid_checkpoint(os.path.dirname(cand))
+                        prev = latest_valid_trainer_checkpoint(os.path.dirname(cand))
                         if prev:
                             print(f"Requested checkpoint missing trainer_state.json. Falling back to previous valid: {prev}")
                             chosen = prev

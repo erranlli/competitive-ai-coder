@@ -51,6 +51,33 @@ def latest_checkpoint(run_dir: str) -> str | None:
         return None
 
 
+def is_valid_trainer_checkpoint_dir(path: str) -> bool:
+    try:
+        if not os.path.isdir(path):
+            return False
+        state_file = os.path.join(path, "trainer_state.json")
+        return os.path.isfile(state_file)
+    except Exception:
+        return False
+
+
+def latest_valid_trainer_checkpoint(parent_dir: str) -> Optional[str]:
+    try:
+        cand = [p for p in os.listdir(parent_dir) if p.startswith("checkpoint-")]
+        cand_full = [os.path.join(parent_dir, p) for p in cand if os.path.isdir(os.path.join(parent_dir, p))]
+        cand_sorted = sorted(
+            cand_full,
+            key=lambda p: int(p.rsplit("-", 1)[-1]) if p.rsplit("-", 1)[-1].isdigit() else -1,
+            reverse=True,
+        )
+        for ck in cand_sorted:
+            if is_valid_trainer_checkpoint_dir(ck):
+                return ck
+    except Exception:
+        pass
+    return None
+
+
 def normalize_single_file(src_dir: str, dst_dir: str) -> bool:
     os.makedirs(dst_dir, exist_ok=True)
     copied = False
