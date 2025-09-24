@@ -2,7 +2,6 @@
 # improved_finetune_qwen_codeforces.py
 import argparse
 import os
-import sys
 import gc
 import math
 import json
@@ -13,30 +12,17 @@ from deepspeed.utils.zero_to_fp32 import convert_zero_checkpoint_to_fp32_state_d
 
 import torch
 from datasets import load_from_disk, Dataset
-
-# Ensure repository root is on sys.path for local package imports
-_CUR_DIR = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.abspath(os.path.join(_CUR_DIR, ".."))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-
 from transformers import (
-    AutoTokenizer,
     AutoModelForCausalLM,
+    AutoTokenizer,
     EarlyStoppingCallback,
-    TrainerCallback,
     TrainingArguments,
     DataCollatorForSeq2Seq,
 )
-from model_util.model_util import load_tokenizer
-from model_util.file_util import ensure_dir, latest_valid_trainer_checkpoint
-from model_util.train_util import (
-    enforce_strict_format,
-    enforce_length_only,
-    get_map_and_tokenize_row,
-    SingleLineMetricsCallback,
-)
+from peft import LoraConfig, PeftModel
 from trl import SFTTrainer
+import numpy as np
+import re
 from tqdm import tqdm
 
 # disable problematic deepspeed optimizations sometimes used on some infra
@@ -44,6 +30,22 @@ os.environ["DEEPSPEED_DISABLE_ZEROFLOW"] = "1"
 
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+# --- Utilities to build messages / extract solution ---
+def build_messages_from_row(row: Dict[str, Any]) -> List[Dict[str, str]]:
+    if isinstance(row.get("messages"), list) and row["messages"]:
+        msgs = []
+        for m in row["messages"]:
+            role = m.get("role") or m.get("from") or "user"
+            content = m.get("content") or m.get("value") or ""
+            if content is None: content = ""
+            msgs.append({"role": role, "content": str(content)})
+        return msgs
+    # fallback: try common fields
+    if "input" in row and "output" in row:
+        return [{"role": "user", "content": str(row["input"])},
+                {"role": "assistant", "content": str(row["output"])}]
+    return []
 
 
 def apply_chat_template(tokenizer: AutoTokenizer, messages: List[Dict[str, str]]) -> str:
@@ -65,14 +67,9 @@ def load_and_format_dataset(
     tokenizer: AutoTokenizer,
     validation_split_percentage: int,
     max_seq_length: int,
-    enforce_format: bool = False,
     max_samples: int = 0,
     single_arrow_file: Optional[str] = None,
     use_first_arrow_in_dir: bool = False,
-    enable_loss_reweight: bool = False,
-    loss_weight_code: float = 1.0,
-    loss_weight_noncode: float = 1.0,
-    mask_noncode: bool = False,
 ) -> Tuple[Dataset, Dataset]:
     ds = None
     # Fast path: load a single Arrow shard
@@ -113,22 +110,51 @@ def load_and_format_dataset(
 
     print(f"Dataset split into {len(train_ds)} training samples and {len(eval_ds)} evaluation samples.")
 
-    # Always enforce length; optionally enforce strict structure/pattern
-    train_ds = enforce_length_only(train_ds, tokenizer, max_seq_length, 'train')
-    eval_ds = enforce_length_only(eval_ds, tokenizer, max_seq_length, 'eval')
-    if enforce_format:
-        train_ds = enforce_strict_format(train_ds, tokenizer, max_seq_length, 'train')
-        eval_ds = enforce_strict_format(eval_ds, tokenizer, max_seq_length, 'eval')
 
+    def map_and_tokenize_row(row: Dict[str, Any]) -> Dict[str, Any]:
+        messages = build_messages_from_row(row)
+        
+        # Ensure the conversation is a valid single-turn exchange
+        if not (len(messages) == 2 and messages[0]['role'] == 'user' and messages[1]['role'] == 'assistant'):
+            return {"input_ids": [], "labels": []}
 
-    map_and_tokenize_row = get_map_and_tokenize_row(
-        tokenizer,
-        max_seq_length,
-        enable_loss_reweight,
-        loss_weight_code,
-        loss_weight_noncode,
-        mask_noncode,
-    )
+        # 1. Create the prompt text by applying the template to the user message only.
+        #    `add_generation_prompt=True` tells the tokenizer to add the special tokens
+        #    that cue the assistant's response (e.g., for Qwen2, it adds `<|im_start|>assistant\n`).
+        #    This gives us the exact prefix that needs to be masked.
+        prompt_text = tokenizer.apply_chat_template(
+            [messages[0]],  # Only the user message
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+        
+        # 2. Create the full conversation text, which includes the assistant's solution.
+        full_text = tokenizer.apply_chat_template(
+            messages, 
+            tokenize=False, 
+            add_generation_prompt=False
+        )
+
+        # 3. Tokenize the prompt text to find its length.
+        prompt_token_ids = tokenizer(prompt_text, add_special_tokens=False)['input_ids']
+        prompt_length = len(prompt_token_ids)
+
+        # 4. Tokenize the full text. This is what the model will actually see.
+        tokenized = tokenizer(
+            full_text,
+            truncation=True,
+            padding=False,
+            max_length=max_seq_length,
+            add_special_tokens=False,
+        )
+
+        # 5. Create the labels and mask the prompt section.
+        #    The first `prompt_length` tokens correspond to the user message and the assistant cue.
+        labels = tokenized["input_ids"].copy()
+        labels[:prompt_length] = [-100] * prompt_length
+        
+        tokenized["labels"] = labels
+        return tokenized
 
 
     num_proc = min(os.cpu_count() - 2, 8) if os.cpu_count() > 4 else 1
@@ -156,11 +182,108 @@ def load_and_format_dataset(
 
 import os
 import torch
+from peft import PeftModel
 
 def is_main_process():
     return int(os.environ.get("LOCAL_RANK", "0")) == 0
 
-# (Removed PEFT/LoRA utilities)
+def merge_and_eval_adapter(adapter_dir: str, base_model_name: str, tokenizer, eval_prompts: List[str], eval_refs: List[str], out_prefix: str):
+    """
+    adapter_dir: path where LoRA adapter (Peft) is saved
+    base_model_name: original HF model id (e.g. Qwen/Qwen2.5-7B-Instruct)
+    tokenizer: tokenizer instance (padding_side already set)
+    eval_prompts / eval_refs: lists extracted from eval dataset (strings)
+    out_prefix: prefix for merged model directory
+    """
+
+    if not is_main_process():
+        print("Not main process; skipping merge/eval.")
+        return
+
+    # If adapter_folder looks like a deepspeed consolidated checkpoint, abort and explain
+    # A PEFT adapter saved via trainer.save_model should contain adapter_config.json and pytorch_model.bin or adapter_model.bin
+    # but DeepSpeed Zero-3 consolidated checkpoint folders can look different.
+    adapter_files = os.listdir(adapter_dir)
+    # quick check
+    if any(f.startswith("global_step") or f.endswith(".pt") for f in adapter_files) and "adapter_config.json" not in adapter_files:
+        print("ERROR: the adapter directory looks like a DeepSpeed ZeRO-3 checkpoint or a non-PEFT folder.")
+        print("If you trained with DeepSpeed ZeRO-3, please run the DeepSpeed zero_to_fp32 conversion (see instructions).")
+        print("Alternatively, ensure you saved the adapter via `trainer.save_model(adapter_dir)` which writes a PEFT adapter layout.")
+        raise RuntimeError("Adapter directory not in PEFT format. Cannot merge safely.")
+
+    print(f"Loading clean base model from hub: {base_model_name} (cpu, fp32) for merging...")
+    # Load the *original* base model from the hub (not any ds checkpoint) — load on CPU to avoid memory pressure.
+    base_model = AutoModelForCausalLM.from_pretrained(
+        base_model_name,
+        torch_dtype=torch.float32,
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,
+    )
+
+    print("Loading PEFT adapter into base model...")
+    peft_loaded = PeftModel.from_pretrained(base_model, adapter_dir, is_trainable=False)
+
+    # find missing keys (PEFT prints some warnings, but we check explicitly)
+    # `peft_loaded` has merged params but we can inspect expected vs found keys using its state_dict
+    adapter_state = {}
+    try:
+        adapter_state = peft_loaded.peft_config.__dict__  # placeholder; we mostly rely on PeftModel errors below
+    except Exception:
+        pass
+
+    # Merge and unload: this will create the merged weights in memory
+    print("Merging adapter weights into the base model (this may take a while)...")
+    try:
+        merged = peft_loaded.merge_and_unload()
+    except Exception as e:
+        print("ERROR during merge_and_unload(). This may happen if the adapter doesn't match the base model.")
+        raise
+
+    merged_model_path = f"{out_prefix}-merged"
+    print(f"Saving merged model to: {merged_model_path}")
+    merged.save_pretrained(merged_model_path, safe_serialization=True)
+    tokenizer.save_pretrained(merged_model_path)
+    print("Merged model saved.")
+
+    # Move merged model to GPU for evaluation if available
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Loading merged model to {device} for evaluation...")
+    merged_for_eval = AutoModelForCausalLM.from_pretrained(merged_model_path, trust_remote_code=True, torch_dtype=torch.bfloat16).to(device)
+    merged_for_eval.eval()
+
+    # Greedy generation/eval (small batches)
+    print("Running greedy generation for PASS@1 evaluation...")
+    batch_size = 2
+    gens = []
+    for i in range(0, len(eval_prompts), batch_size):
+        batch = eval_prompts[i:i+batch_size]
+        enc = tokenizer(batch, return_tensors="pt", padding=True, truncation=True, add_special_tokens=False).to(device)
+        with torch.no_grad():
+            out = merged_for_eval.generate(
+                **enc,
+                max_new_tokens=512,
+                do_sample=False,
+                temperature=0.0,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        for seq in out:
+            gens.append(tokenizer.decode(seq, skip_special_tokens=True))
+    # basic normalized string match metric (you can replace with judge-run)
+    def normalize(s):
+        import re
+        s = s.strip()
+        s = re.sub(r'\r\n', '\n', s)
+        s = re.sub(r'\s+\n', '\n', s)
+        return s
+    correct = 0
+    for ref, gen in zip(eval_refs, gens):
+        if normalize(ref) == normalize(gen) or normalize(ref) in normalize(gen):
+            correct += 1
+    pass1 = correct / max(1, len(eval_prompts))
+    print(f"PASS@1 (normalized-string-match) = {pass1*100:.2f}%")
+
+    return merged_model_path
 
 def check_environment():
     print("=== Environment Check ===")
@@ -281,27 +404,20 @@ def main():
     p.add_argument("--num-train-epochs", type=float, default=3.0)
     p.add_argument("--warmup-ratio", type=float, default=0.03)
     p.add_argument("--eval-steps", type=int, default=2000)
-    p.add_argument("--save-steps", type=int, default=0)
-    p.add_argument("--logging-steps", type=int, default=0)
+    p.add_argument("--save-steps", type=int, default=400)
+    p.add_argument("--logging-steps", type=int, default=20)
     p.add_argument("--validation-split-percentage", type=int, default=5)
     p.add_argument("--early-stopping-patience", type=int, default=3)
     p.add_argument("--use-lora", action="store_true", default=False) #Turn Lora off
     p.add_argument("--lora-r", type=int, default=64)
     p.add_argument("--lora-alpha", type=int, default=128)
     p.add_argument("--lora-dropout", type=float, default=0.05)
-    p.add_argument("--packing", action="store_true", default=False) #Packing hurts performance
     p.add_argument("--max-train-samples", type=int, default=0)
     p.add_argument("--wandb-project", default=None, help="(optional) wandb project name to report to")
     p.add_argument("--disable-training-eval", action="store_true", default=True, help="Disable Trainer evaluation during training to save time")
     p.add_argument("--single-arrow-file", type=str, default=None, help="Path to a single Arrow shard to load instead of the full dataset")
-    p.add_argument("--enforce-format", action="store_true", default=False, help="If set, enforce strict message/format and length filters on the dataset")
     p.add_argument("--use-first-arrow-in-dir", action="store_true", default=False, help="If set, load the first data-*.arrow file under the dataset dir")
     p.add_argument("--resume-from-checkpoint", type=str, default=None, help="Path to a checkpoint dir to resume from (e.g., output_dir/checkpoint-123 or 'last')")
-    # Loss re-weighting for code vs non-code tokens
-    p.add_argument("--enable-loss-reweight", action="store_true", default=False, help="Enable per-token loss re-weighting (code vs non-code)")
-    p.add_argument("--loss-weight-code", type=float, default=1.0, help="Loss weight for code tokens inside ```python blocks")
-    p.add_argument("--loss-weight-noncode", type=float, default=1.0, help="Loss weight for non-code assistant tokens")
-    p.add_argument("--mask-noncode", action="store_true", default=False, help="If set, non-code assistant tokens are masked from loss entirely")
     
     args = p.parse_args()
 
@@ -311,79 +427,60 @@ def main():
     ensure_dir(args.output_dir)
 
     print("Loading tokenizer...")
-    tokenizer = load_tokenizer(args.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    # IMPORTANT: decoder-only models require left padding for correct generation
+    tokenizer.padding_side = "left"
 
     print("Loading and formatting dataset...")
     train_dataset, eval_dataset = load_and_format_dataset(
         args.dataset_path, tokenizer, args.validation_split_percentage,
-        max_seq_length=args.max_seq_length, enforce_format=args.enforce_format, max_samples=args.max_train_samples,
-        single_arrow_file=args.single_arrow_file, use_first_arrow_in_dir=args.use_first_arrow_in_dir,
-        enable_loss_reweight=args.enable_loss_reweight,
-        loss_weight_code=args.loss_weight_code,
-        loss_weight_noncode=args.loss_weight_noncode,
-        mask_noncode=args.mask_noncode
+        max_seq_length=args.max_seq_length, max_samples=args.max_train_samples,
+        single_arrow_file=args.single_arrow_file, use_first_arrow_in_dir=args.use_first_arrow_in_dir
     )
 
     print("Loading model...")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name, trust_remote_code=True,
-        dtype=torch.bfloat16, use_cache=False, attn_implementation="flash_attention_2"
+        torch_dtype=torch.bfloat16, use_cache=False, attn_implementation="flash_attention_2"
     )
 
+    peft_config = None
+    if args.use_lora:
+        print("Configuring LoRA...")
+        peft_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        )
 
     # TrainingArguments tuned for stable fine-tune
     do_eval = not args.disable_training_eval
     eval_strategy_value = "steps" if do_eval else "no"
     load_best_value = True if do_eval else False
-    # Compute dynamic steps for ~0.5 epoch logging/eval and 2-epoch checkpointing
-    try:
-        world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
-    except Exception:
-        world_size = 1
-    updates_per_epoch = max(1, math.ceil(len(train_dataset) / (args.per_device_train_batch_size * world_size * args.gradient_accumulation_steps)))
-    save_steps_calc = max(1, updates_per_epoch * 1)  # every 1 epochs
-    log_steps_calc = max(1, updates_per_epoch // 20)  # ~ every 0.05 epoch
-
-    # Build TrainingArguments with compatibility across Transformers versions
-    ta_fields = getattr(TrainingArguments, "__dataclass_fields__", {})
-    strategy_key = "evaluation_strategy" if "evaluation_strategy" in ta_fields else (
-        "eval_strategy" if "eval_strategy" in ta_fields else None
-    )
-
-    ta_kwargs = dict(
+    training_args = TrainingArguments(
         output_dir=args.output_dir,
         deepspeed=args.deepspeed if int(os.environ.get("WORLD_SIZE", "1")) > 1 else None,
-        bf16=True,
-        do_train=True,
-        do_eval=do_eval,
-        eval_steps=log_steps_calc,
-        save_strategy="steps",
-        save_steps=save_steps_calc,
+        bf16=True, do_train=True, do_eval=do_eval,
+        eval_strategy=eval_strategy_value, eval_steps=args.eval_steps,
+        save_strategy="steps", save_steps=args.save_steps,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         gradient_checkpointing=True,
-        learning_rate=args.learning_rate,
-        weight_decay=0.05, # For instruction/code SFT, common successful ranges are 0.01–0.05; TODO
-        warmup_ratio=args.warmup_ratio,
-        lr_scheduler_type="cosine",
-        logging_steps=log_steps_calc,
+        learning_rate=args.learning_rate, weight_decay=0.1,
+        warmup_ratio=args.warmup_ratio, lr_scheduler_type="cosine",
+        logging_steps=args.logging_steps,
         save_total_limit=3,
+        load_best_model_at_end=False, #TODO load_best_value, metric_for_best_model="eval_loss", greater_is_better=False,
         num_train_epochs=args.num_train_epochs,
         report_to=args.report_to,
         remove_unused_columns=False,
         dataloader_pin_memory=False,
-        max_grad_norm=1.0, # curb exploding updates that drive verbosity and repetition
     )
-    if strategy_key is not None:
-        ta_kwargs[strategy_key] = eval_strategy_value
-    if "load_best_model_at_end" in ta_fields:
-        ta_kwargs["load_best_model_at_end"] = load_best_value
-    if "metric_for_best_model" in ta_fields:
-        ta_kwargs["metric_for_best_model"] = "eval_loss"
-    if "greater_is_better" in ta_fields:
-        ta_kwargs["greater_is_better"] = False
-
-    training_args = TrainingArguments(**ta_kwargs)
 
     # Data collator that pads input_ids AND labels (label_pad_token_id=-100)
     data_collator = DataCollatorForSeq2Seq(
@@ -393,256 +490,35 @@ def main():
         pad_to_multiple_of=8
     )
 
-    class WeightedSFTTrainer(SFTTrainer):
-        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-            loss_weights = inputs.pop("loss_weights", None)
-            outputs = model(**inputs)
-            if loss_weights is None:
-                # Compute and stash extra metrics; merge at on_log for single-line printing
-                try:
-                    # Robustly get logits across different ModelOutput types
-                    logits = None
-                    try:
-                        logits = outputs.logits  # prefer attribute access
-                    except Exception:
-                        pass
-                    if logits is None and isinstance(outputs, dict):
-                        logits = outputs.get("logits", None)
-
-                    labels = inputs.get("labels", None)
-                    if logits is not None and labels is not None:
-                        with torch.no_grad():
-                            shift_logits = logits[..., :-1, :].contiguous()
-                            shift_labels = labels[..., 1:].contiguous()
-                            valid_mask = (shift_labels != -100)
-                            if valid_mask.any():
-                                pred_tokens = shift_logits.argmax(dim=-1)
-                                correct = (pred_tokens == shift_labels) & valid_mask
-                                mean_acc = (correct.sum().float() / valid_mask.sum().float()).item()
-                                log_probs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
-                                probs = torch.exp(log_probs)
-                                ent = (-probs * log_probs).sum(dim=-1)
-                                mean_ent = ent[valid_mask].mean().item()
-                                if not hasattr(self, "_cumulative_tokens"):
-                                    self._cumulative_tokens = 0.0
-                                self._cumulative_tokens += float(valid_mask.sum().item())
-                                self._last_extra_metrics = {
-                                    "mean_token_accuracy": mean_acc,
-                                    "entropy": mean_ent,
-                                    "num_tokens": float(self._cumulative_tokens),
-                                    "epoch": float(getattr(self.state, "epoch", 0.0) or 0.0),
-                                }
-                except Exception:
-                    pass
-                return (outputs.loss, outputs) if return_outputs else outputs.loss
-
-            try:
-                # Robustly get logits across different ModelOutput types
-                logits = None
-                try:
-                    logits = outputs.logits
-                except Exception:
-                    pass
-                if logits is None and isinstance(outputs, dict):
-                    logits = outputs.get("logits", None)
-
-                labels = inputs.get("labels", None)
-                if logits is None or labels is None:
-                    return (outputs.loss, outputs) if return_outputs else outputs.loss
-
-                # Shift for next-token prediction
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-
-                # Per-token CE loss (no reduction)
-                loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
-                per_token_loss = loss_fct(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1)
-                )
-
-                # Convert and align weights to [B, T]
-                B, T = labels.size(0), labels.size(1)
-                device = labels.device
-                dtype = per_token_loss.dtype
-
-                w = loss_weights
-                if not torch.is_tensor(w):
-                    try:
-                        w = torch.tensor(w, device=device, dtype=dtype)
-                    except Exception:
-                        w = None
-                if w is None:
-                    return (outputs.loss, outputs) if return_outputs else outputs.loss
-
-                # Ensure 2D [B, T]
-                if w.dim() == 1:
-                    if w.numel() == T:
-                        w = w.view(1, T).expand(B, T)
-                    elif w.numel() == B * T:
-                        w = w.view(B, T)
-                    else:
-                        w = w.new_ones((B, T))
-                elif w.dim() == 2:
-                    # Pad/trim rows/cols to [B,T]
-                    if w.size(0) != B:
-                        if w.size(0) > B:
-                            w = w[:B, :]
-                        else:
-                            pad_rows = B - w.size(0)
-                            w = torch.cat([w, w.new_ones((pad_rows, min(w.size(1), T)))], dim=0)
-                    if w.size(1) != T:
-                        if w.size(1) > T:
-                            w = w[:, :T]
-                        else:
-                            pad_cols = T - w.size(1)
-                            w = torch.cat([w, w.new_ones((B, pad_cols))], dim=1)
-                else:
-                    w = w.view(B, T)
-
-                # Shift weights to align with shifted labels
-                shifted_weights = w[..., 1:].contiguous()
-                flat_weights = shifted_weights.view(-1)
-
-                # Valid tokens mask (ignore -100)
-                valid_mask = (shift_labels.view(-1) != -100)
-
-                weighted_loss = per_token_loss * flat_weights
-                sum_weighted = weighted_loss[valid_mask].sum()
-                sum_weights = flat_weights[valid_mask].sum()
-                loss = sum_weighted / torch.clamp(sum_weights, min=1.0)
-
-                # Stash extra metrics for merging at log-time
-                try:
-                    with torch.no_grad():
-                        valid_mask = (shift_labels != -100)
-                        if valid_mask.any():
-                            pred_tokens = shift_logits.argmax(dim=-1)
-                            correct = (pred_tokens == shift_labels) & valid_mask
-                            mean_acc = (correct.sum().float() / valid_mask.sum().float()).item()
-                            log_probs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
-                            probs = torch.exp(log_probs)
-                            ent = (-probs * log_probs).sum(dim=-1)
-                            mean_ent = ent[valid_mask].mean().item()
-                            if not hasattr(self, "_cumulative_tokens"):
-                                self._cumulative_tokens = 0.0
-                            self._cumulative_tokens += float(valid_mask.sum().item())
-                            self._last_extra_metrics = {
-                                "mean_token_accuracy": mean_acc,
-                                "entropy": mean_ent,
-                                "num_tokens": float(self._cumulative_tokens),
-                                "epoch": float(getattr(self.state, "epoch", 0.0) or 0.0),
-                            }
-                except Exception:
-                    pass
-
-                return (loss, outputs) if return_outputs else loss
-            except Exception:
-                return (outputs.loss, outputs) if return_outputs else outputs.loss
-
-    class SingleLineMetricsCallback(TrainerCallback):
-        def __init__(self, trainer_ref):
-            self.trainer_ref = trainer_ref
-            self._last_grad_norm: Optional[float] = None
-
-        def on_step_end(self, args, state, control, **kwargs):
-            try:
-                model = kwargs.get("model", None)
-                if model is None and hasattr(self.trainer_ref, "model"):
-                    model = self.trainer_ref.model
-                grad_norm_sq = 0.0
-                any_grad = False
-                if model is not None:
-                    for p in model.parameters():
-                        if p.grad is not None:
-                            g = p.grad.data
-                            val = g.norm(2).item()
-                            grad_norm_sq += val * val
-                            any_grad = True
-                grad_norm = (grad_norm_sq ** 0.5) if any_grad else 0.0
-
-                # Prefer DeepSpeed's global grad norm if available
-                try:
-                    ds_engine = getattr(self.trainer_ref, "deepspeed", None)
-                    if ds_engine is not None:
-                        if hasattr(ds_engine, "get_global_grad_norm"):
-                            gn = ds_engine.get_global_grad_norm()
-                            if gn is not None:
-                                grad_norm = float(gn)
-                        elif hasattr(ds_engine, "get_global_norm"):
-                            gn = ds_engine.get_global_norm()
-                            if gn is not None:
-                                grad_norm = float(gn)
-                except Exception:
-                    pass
-
-                self._last_grad_norm = float(grad_norm)
-            except Exception:
-                self._last_grad_norm = None
-
-        def on_log(self, args, state, control, logs=None, **kwargs):
-            try:
-                if logs is None:
-                    return
-                # Merge last extra metrics computed during compute_loss
-                extra = getattr(self.trainer_ref, "_last_extra_metrics", None)
-                if isinstance(extra, dict):
-                    logs.update(extra)
-                # Add grad_norm captured at step end so it prints on the same line
-                if self._last_grad_norm is not None:
-                    logs["grad_norm"] = self._last_grad_norm
-            except Exception:
-                return
-
-    _callbacks: List[Any] = []
-    if do_eval:
-        _callbacks.append(EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience))
-
-    trainer = WeightedSFTTrainer(
+    trainer = SFTTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        peft_config=None,
-        callbacks=_callbacks,
+        peft_config=peft_config,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience)] if do_eval else None,
         data_collator=data_collator,
     )
-
-    # Ensure single-line merged metrics at each logging step
-    trainer.add_callback(SingleLineMetricsCallback(trainer))
 
     # Start training
     try:
         print("Starting training...")
         resume_arg = None
         if args.resume_from_checkpoint:
-            req = args.resume_from_checkpoint.strip()
-            chosen = None
-            if req.lower() == "last":
-                chosen = latest_valid_trainer_checkpoint(args.output_dir)
-                if chosen:
-                    print(f"Resuming from last valid checkpoint: {chosen}")
+            if args.resume_from_checkpoint.strip().lower() == "last":
+                # Find latest checkpoint-* under output_dir
+                ckpts = sorted(glob.glob(os.path.join(args.output_dir, "checkpoint-*")), key=lambda p: int(p.rsplit("-", 1)[-1]) if p.rsplit("-", 1)[-1].isdigit() else -1)
+                if ckpts:
+                    resume_arg = ckpts[-1]
+                    print(f"Resuming from last checkpoint: {resume_arg}")
                 else:
-                    print("No valid checkpoints (with trainer_state.json) found; starting fresh.")
+                    print("No checkpoint-* directories found to resume from; starting fresh.")
             else:
-                cand = req
-                if os.path.isdir(cand):
-                    base = os.path.basename(cand)
-                    if base.startswith("global_step"):
-                        cand = os.path.dirname(cand)
-                    if os.path.isfile(os.path.join(cand, "trainer_state.json")):
-                        chosen = cand
-                        print(f"Resuming from checkpoint: {chosen}")
-                    else:
-                        prev = latest_valid_trainer_checkpoint(os.path.dirname(cand))
-                        if prev:
-                            print(f"Requested checkpoint missing trainer_state.json. Falling back to previous valid: {prev}")
-                            chosen = prev
-                        else:
-                            print(f"No valid checkpoints found near requested path: {req}. Starting fresh.")
+                if os.path.isdir(args.resume_from_checkpoint):
+                    resume_arg = args.resume_from_checkpoint
+                    print(f"Resuming from checkpoint: {resume_arg}")
                 else:
-                    print(f"Provided --resume-from-checkpoint does not exist: {req}. Starting fresh.")
-            resume_arg = chosen
+                    print(f"Provided --resume-from-checkpoint does not exist: {args.resume_from_checkpoint}. Starting fresh.")
 
         trainer.train(resume_from_checkpoint=resume_arg)
         print("Training completed successfully!")
