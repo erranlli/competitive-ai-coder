@@ -9,88 +9,26 @@ from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoConfig
 from vllm import LLM, SamplingParams
-import tempfile
-import shutil
-import re
+
+from model_util.file_util import (
+    ensure_dir,
+    resolve_outfile,
+    prepare_model_dir as resolve_model_dir,
+)
+from model_util.text_util import (
+    normalize_text,
+    extract_code_from_text,
+)
+from model_util.model_util import (
+    get_model_config_fields,
+    detect_model_type,
+    load_tokenizer,
+)
+
 try:
     from deepspeed.utils.zero_to_fp32 import convert_zero_checkpoint_to_fp32_state_dict as ds_convert
 except Exception:
     ds_convert = None
-
-
-def ensure_dir(path: str) -> None:
-    """Ensures that a directory exists."""
-    os.makedirs(path, exist_ok=True)
-
-
-def normalize_text(text: str) -> str:
-    """Normalizes text by removing trailing whitespace from lines."""
-    if text is None:
-        return ""
-    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    return "\n".join(line.rstrip() for line in lines).strip()
-
-
-def extract_code_from_text(generated: str, language_hint: str = "python") -> str:
-    """Extracts code from a fenced code block in markdown-formatted text."""
-    import re
-
-    if generated is None:
-        return ""
-    fence_pattern = re.compile(r"```(?:" + re.escape(language_hint) + r"|\w+)?\n([\s\S]*?)```", re.IGNORECASE)
-    match = fence_pattern.search(generated)
-    if match:
-        return match.group(1).strip()
-    any_fence = re.compile(r"```\n([\s\S]*?)```")
-    match = any_fence.search(generated)
-    if match:
-        return match.group(1).strip()
-    return generated.strip()
-
-
-def sanitize_for_filename(text: str) -> str:
-    """Sanitizes a string to be used as a valid filename."""
-    import re
-
-    t = (text or "").strip().lower()
-    t = t.replace("/", "-")
-    t = t.replace(" ", "_")
-    t = re.sub(r"[^a-z0-9._-]", "", t)
-    t = re.sub(r"[-_]{2,}", "-", t)
-    return t or "model"
-
-
-def resolve_outfile(model_name: str, dataset_name: str, subset: str, split: str) -> str:
-    """Derives a standardized output filename."""
-    model_tag = sanitize_for_filename(model_name)
-    ds_tag = sanitize_for_filename(dataset_name)
-    subset_tag = sanitize_for_filename(subset)
-    split_tag = sanitize_for_filename(split)
-    return f"{model_tag}__{ds_tag}__{subset_tag}__{split_tag}__vllm.jsonl"
-
-
-def get_model_config_fields(model_name: str) -> Tuple[int, int, int]:
-    """Return (num_heads, num_kv_heads, max_position_embeddings) if available, else zeros."""
-    try:
-        cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-        num_heads = int(getattr(cfg, "num_attention_heads", 0) or 0)
-        num_kv_heads = int(getattr(cfg, "num_key_value_heads", 0) or 0)
-        max_len = int(getattr(cfg, "max_position_embeddings", 0) or 0)
-        return num_heads, num_kv_heads, max_len
-    except Exception:
-        return 0, 0, 0
-
-
-def detect_model_type(model_name: str) -> str:
-    """Detect the model type for prompt optimization."""
-    model_lower = model_name.lower()
-    if "deepseek-r1" in model_lower:
-        return "deepseek-r1"
-    elif "qwen2.5" in model_lower:
-        return "qwen2.5"
-    elif "qwen3" in model_lower:
-        return "qwen3"
-    return "generic"
 
 
 def build_prompt_from_row(
@@ -317,135 +255,10 @@ def generate_with_vllm(cfg: GenConfig) -> str:
     
     num_visible_gpus = len(os.environ.get("CUDA_VISIBLE_DEVICES", "").split(',')) if os.environ.get("CUDA_VISIBLE_DEVICES") else 1
 
-    def _latest_checkpoint(run_dir: str) -> Optional[str]:
-        try:
-            cks = [d for d in os.listdir(run_dir) if d.startswith("checkpoint-") and os.path.isdir(os.path.join(run_dir, d))]
-            if not cks:
-                return None
-            cks_sorted = sorted(cks, key=lambda n: int(re.sub(r"[^0-9]", "", n)) if re.search(r"\d+", n) else -1)
-            return os.path.join(run_dir, cks_sorted[-1])
-        except Exception:
-            return None
+    # use shared latest_checkpoint()
 
-    def _normalize_single_file(src_dir: str, dst_dir: str) -> bool:
-        os.makedirs(dst_dir, exist_ok=True)
-        copied = False
-        for name in ["pytorch_model.bin", "model.safetensors"]:
-            p = os.path.join(src_dir, name)
-            if os.path.isfile(p):
-                shutil.copy2(p, os.path.join(dst_dir, name))
-                copied = True
-        # Nested bug case: dir named pytorch_model.bin/
-        nested = os.path.join(src_dir, "pytorch_model.bin")
-        if os.path.isdir(nested):
-            inner_bin = os.path.join(nested, "pytorch_model.bin")
-            inner_safe = os.path.join(nested, "model.safetensors")
-            if os.path.isfile(inner_bin):
-                shutil.copy2(inner_bin, os.path.join(dst_dir, "pytorch_model.bin"))
-                copied = True
-            elif os.path.isfile(inner_safe):
-                shutil.copy2(inner_safe, os.path.join(dst_dir, "model.safetensors"))
-                copied = True
-        if copied:
-            for fname in [
-                "config.json","generation_config.json","tokenizer.json","tokenizer_config.json",
-                "special_tokens_map.json","vocab.json","merges.txt","added_tokens.json","chat_template.jinja",
-            ]:
-                s = os.path.join(src_dir, fname)
-                if os.path.isfile(s):
-                    try: shutil.copy2(s, os.path.join(dst_dir, fname))
-                    except Exception: pass
-        return copied
 
-#
-# ... (all the code before prepare_model_dir)
-#
-
-    def prepare_model_dir() -> str:
-        # 1) No checkpoint_path: return model_name
-        if not cfg.checkpoint_path or not os.path.exists(cfg.checkpoint_path):
-            return cfg.model_name
-
-        path = cfg.checkpoint_path
-        # If a run dir with checkpoint-*/ exists, pick latest
-        if os.path.isdir(path) and any(n.startswith("checkpoint-") for n in os.listdir(path)):
-            ck = _latest_checkpoint(path)
-            if ck:
-                path = ck
-
-        # If this looks like a DeepSpeed checkpoint (has global_step*/ inside)
-        if os.path.isdir(path) and any(n.startswith("global_step") for n in os.listdir(path)):
-            if ds_convert is None:
-                print("Warning: deepspeed not available; cannot auto-convert ZeRO checkpoint. Falling back to model_name.")
-                return cfg.model_name
-            tmpdir = tempfile.mkdtemp(prefix="vllm_ds2hf_")
-            out_file = os.path.join(tmpdir, "pytorch_model.bin")
-            try:
-                print(f"Auto-converting DeepSpeed checkpoint: {path} -> {out_file}")
-                ds_convert(path, out_file)
-                
-                # FIXED BLOCK: START
-                # If ds_convert creates a directory for sharded weights, normalize the structure.
-                if os.path.isdir(out_file):
-                    print(f"Normalizing sharded checkpoint structure created at: {out_file}")
-                    # Move all files from the subdirectory (e.g., index, shards) to the parent tmpdir
-                    for item in os.listdir(out_file):
-                        shutil.move(os.path.join(out_file, item), os.path.join(tmpdir, item))
-                    # Remove the now-empty, problematic directory
-                    os.rmdir(out_file)
-                # FIXED BLOCK: END
-
-                # Save tokenizer and config alongside for completeness
-                try:
-                    tok = AutoTokenizer.from_pretrained(cfg.model_name, trust_remote_code=True)
-                    tok.save_pretrained(tmpdir)
-                except Exception: pass
-                try:
-                    conf = AutoConfig.from_pretrained(cfg.model_name, trust_remote_code=True)
-                    conf.save_pretrained(tmpdir)
-                except Exception: pass
-                return tmpdir
-            except Exception as e:
-                print(f"Auto-convert failed: {e}")
-                shutil.rmtree(tmpdir) # Clean up temp directory on failure
-                return cfg.model_name
-
-        # If directory already has a single-file weight or nested bug, normalize
-        tmpdir = tempfile.mkdtemp(prefix="vllm_norm_")
-        if _normalize_single_file(path, tmpdir):
-            return tmpdir
-
-        # If it's an HF sharded directory with index at root, vLLM can usually load directly
-        index_root = os.path.join(path, "pytorch_model.bin.index.json")
-        if os.path.isfile(index_root):
-            return path
-
-        # If shards are nested under pytorch_model.bin/, normalize them upward (copy index/shards)
-        nested_index = os.path.join(path, "pytorch_model.bin", "pytorch_model.bin.index.json")
-        if os.path.isfile(nested_index):
-            try:
-                # Copy all files from nested into tmpdir
-                for n in os.listdir(os.path.dirname(nested_index)):
-                    s = os.path.join(os.path.dirname(nested_index), n)
-                    d = os.path.join(tmpdir, n)
-                    if os.path.isfile(s): shutil.copy2(s, d)
-                # Copy tokenizer/config from root
-                for fname in [
-                    "config.json","generation_config.json","tokenizer.json","tokenizer_config.json",
-                    "special_tokens_map.json","vocab.json","merges.txt","added_tokens.json","chat_template.jinja",
-                ]:
-                    s = os.path.join(path, fname)
-                    if os.path.isfile(s): shutil.copy2(s, os.path.join(tmpdir, fname))
-                return tmpdir
-            except Exception:
-                pass
-
-        # Otherwise fall back to model_name
-        return cfg.model_name
-
-    # (removed unused duplicate prepare_model_dir0 and stray code)
-
-    model_to_use = prepare_model_dir()
+    model_to_use = resolve_model_dir(cfg.checkpoint_path, cfg.model_name, ds_convert)
     print(f"Using model: {model_to_use}")
 
     num_heads, num_kv_heads, model_max_len = get_model_config_fields(model_to_use)
@@ -509,7 +322,7 @@ def generate_with_vllm(cfg: GenConfig) -> str:
             stop=stop_list,
         )
     
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, trust_remote_code=True)
+    tokenizer = load_tokenizer(cfg.model_name)
     
     pbar = tqdm(total=len(rows), desc="Processing prompts")
     for batch in chunked(rows, cfg.batch_size):
