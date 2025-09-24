@@ -13,12 +13,15 @@ from deepspeed.utils.zero_to_fp32 import convert_zero_checkpoint_to_fp32_state_d
 
 import torch
 from datasets import load_from_disk, Dataset
-\n+# Ensure repository root is on sys.path for local package imports
+
+# Ensure repository root is on sys.path for local package imports
 _CUR_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_CUR_DIR, ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-\n+from transformers import (
+
+from transformers import (
+    AutoTokenizer,
     AutoModelForCausalLM,
     EarlyStoppingCallback,
     TrainerCallback,

@@ -1,12 +1,20 @@
 import argparse
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Tuple, Optional
 
 from datasets import load_dataset
 from tqdm import tqdm
+
+# Ensure repository root is on sys.path for local package imports
+_CUR_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.abspath(os.path.join(_CUR_DIR, ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 from transformers import AutoTokenizer, AutoConfig
 from vllm import LLM, SamplingParams
 
