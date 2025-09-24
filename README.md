@@ -17,17 +17,18 @@ End-to-end pipeline for training, generating, and evaluating competitive program
   - `visualize/`: Gradio/web visualizer for dataset inspection
   - See `datasets/README.md` for details
 - `train/`
-  - `train_qwen_think.py`: main SFT trainer (with code-token loss re-weighting)
+  - `train_qwen_think.py`: main SFT trainer (with code-token loss re-weighting; imports from `model_util`)
   - `consolidate_cpu.py`: DeepSpeed → HF weights in-place
   - `merge_shards_cpu.py`: HF sharded → single-file directory
   - See `train/README.md` for usage
 - `infer/`
-  - `generate_qwen_vllm_think.py`: batched generation with vLLM
+  - `generate_qwen_vllm_think.py`: batched generation with vLLM (uses `model_util` for model/path resolution)
   - See `infer/README.md` for decoding tips
 - `eval/`
   - `eval_with_piston_gentest_checker_stats.py`: checker-aware evaluation + stats
   - See `eval/README.md` for server notes and options
 - `data_util/`: reusable pretty-printers, record lookup, and eval renderers used in notebooks
+- `model_util/`: shared utilities for training and inference (see `model_util/README.md`)
 - `benchmark/`: notebooks and small JSON builders for quick sanity checks (see `benchmark/README.md`)
 - `test/`: Piston smoke tests (see `test/README.md`)
 
