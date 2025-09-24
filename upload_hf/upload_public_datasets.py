@@ -10,6 +10,12 @@ def upload_selective_datasets():
     # --- Configuration ---
     dataset_mappings = [
         {
+            "local_path": Path("/mnt/data2/codeforces_cots_high_quality.arrow"),
+            "repo_id": "erranli/codeforces-cot-highquality",
+            "glob_pattern": "data-*.arrow",  # <-- THIS LINE IS THE FIX
+            "is_private": False 
+        },
+        {
             "local_path": Path("/mnt/data2/new_deepcoder_cots_arrow_appexp"),
             "repo_id": "erranli/deepcoder-train-success",
             "glob_pattern": "data-*.arrow",  # <-- THIS LINE IS THE FIX

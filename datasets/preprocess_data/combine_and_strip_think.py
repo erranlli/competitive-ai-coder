@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Combine two CoT-style datasets into a mixed set:
+Combine two CoT-style datasets into a mixed set, stripping <think> blocks from the second:
 
 - Keep ALL samples from the first dataset
 - From the second dataset:
-  - Keep only samples with token length >= threshold (default: 16000)
+  - Keep only samples with token length <= max_len (default: 16384)
   - Drop any sample that has an 8-gram overlap with the first dataset
+  - Strip all <think>...</think> blocks from assistant responses
 
-Saves the result via datasets.save_to_disk to the output directory (default: ./cot_deepcoder_mix).
+Saves the result via datasets.save_to_disk to the output directory.
 """
 
 import argparse
@@ -142,11 +143,40 @@ def collect_8gram_index(ds: Dataset) -> Dict[Tuple[str, ...], Set[int]]:
     return index
 
 
+def strip_think_blocks(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Strips <think> blocks from assistant messages or fallback text fields."""
+    try:
+        # Prioritize 'messages' field, as it's the most structured
+        msgs = row.get("messages")
+        if isinstance(msgs, list) and msgs:
+            for i, m in enumerate(msgs):
+                if isinstance(m, dict) and m.get("role") == "assistant":
+                    content = m.get("content")
+                    if isinstance(content, str):
+                        stripped = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                        row["messages"][i]["content"] = stripped
+                        # Return after finding and stripping the first assistant message
+                        return row
+    except Exception:
+        # Ignore errors in message parsing, proceed to fallbacks
+        pass
+
+    # Fallback to other common fields if 'messages' is not present or structured as expected
+    for key in ("generation", "output", "answer"):
+        val = row.get(key)
+        if isinstance(val, str) and "<think>" in val:
+            row[key] = re.sub(r"<think>.*?</think>", "", val, flags=re.DOTALL).strip()
+            # Return after stripping the first fallback field found
+            return row
+
+    return row
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Combine two CoT datasets into a mixed set with dedup and length filtering")
+    p = argparse.ArgumentParser(description="Combine two CoT datasets, stripping <think> blocks from the second dataset.")
     p.add_argument("--first-ds", required=True, help="Path to the first dataset (kept entirely)")
-    p.add_argument("--second-ds", required=True, help="Path to the second dataset (filtered)")
-    p.add_argument("--output-dir", default="./cot_deepcoder_mix", help="Output directory for the combined dataset")
+    p.add_argument("--second-ds", required=True, help="Path to the second dataset (filtered and stripped)")
+    p.add_argument("--output-dir", required=True, help="Output directory for the combined dataset")
     p.add_argument("--tokenizer-model", default="Qwen/Qwen2.5-7B-Instruct", help="Model name for tokenization")
     p.add_argument("--max-len", type=int, default=16384, help="Maximum token length to keep from the second dataset")
     p.add_argument("--num-proc", type=int, default=max(1, (os.cpu_count() or 4) - 2), help="Processes for map/filter")
@@ -228,15 +258,18 @@ def main() -> None:
                         dropped_count["n"] += 1
                         return False
             return True
-        except Exception[]:
+        except Exception:
             return True
 
     print("Removing rows from second dataset with 8-gram overlap against first dataset...")
     ds2_filtered = ds2_len.filter(no_overlap_with_first, desc="8-gram dedup vs first")
     print(f"Second dataset after dedup: {len(ds2_filtered)} (dropped {dropped_count['n']} due to overlaps; max drops allowed = {len(ds1)}; length_mode={args.length_mode})")
 
+    print("Stripping <think> blocks from the second dataset...")
+    ds2_stripped = ds2_filtered.map(strip_think_blocks, desc="Stripping <think> blocks", num_proc=max(1, args.num_proc))
+
     # Combine
-    combined = concatenate_datasets([ds1, ds2_filtered])
+    combined = concatenate_datasets([ds1, ds2_stripped])
     print(f"Combined rows: {len(combined)}")
 
     # Save
@@ -252,5 +285,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
