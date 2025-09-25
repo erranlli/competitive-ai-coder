@@ -11,7 +11,8 @@ from pygments.formatters import html
 from pygments.util import ClassNotFound
 
 # --- Configuration ---
-DATASET_A_PATH = "/mnt/data2/filtered_datasets_flexible_match/successful_solutions"
+# DATASET_A_PATH = "/mnt/data2/filtered_datasets_flexible_match/successful_solutions"
+DATASET_A_PATH = "/mnt/data2/codeforces_cots_high_quality.arrow"
 DATASET_B_PATH = "/mnt/data2/new_deepcoder_cots_arrow_appexp"
 
 # --- HTML Template ---

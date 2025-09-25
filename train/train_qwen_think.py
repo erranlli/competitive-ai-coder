@@ -62,84 +62,93 @@ def apply_chat_template(tokenizer: AutoTokenizer, messages: List[Dict[str, str]]
         return "\n".join(parts)
 
 # --- Dataset loader + tokenizer mapping (with label masking) ---
+# In your train_qwen_think.py script:
+# DELETE the existing load_and_format_dataset function and REPLACE it with this.
+# In your training script:
+# DELETE the existing load_and_format_dataset function and REPLACE it with this.
 def load_and_format_dataset(
     dataset_path: str,
     tokenizer: AutoTokenizer,
-    validation_split_percentage: int,
     max_seq_length: int,
-    max_samples: int = 0,
-    single_arrow_file: Optional[str] = None,
-    use_first_arrow_in_dir: bool = False,
+    validation_split_percentage: int,
+    max_samples: int = 0, # Added max_samples back
 ) -> Tuple[Dataset, Dataset]:
-    ds = None
-    # Fast path: load a single Arrow shard
-    if single_arrow_file and os.path.isfile(single_arrow_file):
-        print(f"Loading dataset from single Arrow file: {single_arrow_file}")
-        ds = Dataset.from_file(single_arrow_file)
-    else:
-        if not os.path.exists(dataset_path):
-            raise FileNotFoundError(f"Dataset path not found: {dataset_path}")
-        # Optionally pick the first data-*.arrow inside the directory
-        if use_first_arrow_in_dir and os.path.isdir(dataset_path):
-            import glob as _glob
-            arrow_files = sorted(_glob.glob(os.path.join(dataset_path, "data-*.arrow")))
-            # Prefer data-00000-of-*.arrow if present for stability
-            preferred = [p for p in arrow_files if os.path.basename(p).startswith("data-00000-of-")]
-            pick = preferred[0] if preferred else (arrow_files[0] if arrow_files else None)
-            if pick and os.path.isfile(pick):
-                print(f"Loading dataset from first Arrow shard in dir: {pick}")
-                ds = Dataset.from_file(pick)
-        if ds is None:
-            print(f"Loading dataset from local path: {dataset_path}")
-            ds = load_from_disk(dataset_path)
+    """
+    Loads, splits, filters by token length, sub-samples, and tokenizes the dataset.
+    """
+    print(f"Loading dataset from local path: {dataset_path}")
+    ds = load_from_disk(dataset_path)
 
-    # support various split shapes
+    # 1. Handle dataset splitting
     if isinstance(ds, dict):
-        if 'train' in ds and 'validation' in ds:
-            train_ds, eval_ds = ds['train'], ds['validation']
-        elif 'train' in ds and 'test' in ds:
-            train_ds, eval_ds = ds['train'], ds['test']
-        else:
+        train_ds, eval_ds = ds.get('train'), ds.get('validation')
+        if not train_ds or not eval_ds:
             ds = next(iter(ds.values()))
-            ds_splits = ds.train_test_split(test_size=float(validation_split_percentage) / 100.0, seed=42)
+            ds_splits = ds.train_test_split(test_size=validation_split_percentage / 100.0, seed=42)
             train_ds, eval_ds = ds_splits["train"], ds_splits["test"]
     else:
-        # Single file case or monolithic dataset: create a split
-        ds_splits = ds.train_test_split(test_size=float(validation_split_percentage) / 100.0, seed=42)
+        ds_splits = ds.train_test_split(test_size=validation_split_percentage / 100.0, seed=42)
         train_ds, eval_ds = ds_splits["train"], ds_splits["test"]
 
-    print(f"Dataset split into {len(train_ds)} training samples and {len(eval_ds)} evaluation samples.")
+    print(f"Initial dataset split: {len(train_ds)} training samples, {len(eval_ds)} evaluation samples.")
+
+    # 2. Define the filtering function
+    def filter_by_length(dataset_split: Dataset, split_name: str) -> Dataset:
+        initial_count = len(dataset_split)
+        if initial_count == 0:
+            return dataset_split
+        
+        filtered_indices = []
+        print(f"Filtering {split_name} dataset by token length (<= {max_seq_length})...")
+        
+        for i, row in enumerate(tqdm(dataset_split, desc=f"Scanning {split_name} for length")):
+            messages = build_messages_from_row(row)
+            if not (len(messages) == 2 and messages[0]['role'] == 'user'):
+                continue
+
+            try:
+                full_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+                tokenized = tokenizer(full_text, add_special_tokens=False)
+                if len(tokenized["input_ids"]) <= max_seq_length:
+                    filtered_indices.append(i)
+            except Exception:
+                continue
+        
+        filtered_ds = dataset_split.select(filtered_indices)
+        print(f"Length filter for {split_name}: Kept {len(filtered_ds)} of {initial_count} samples.")
+        return filtered_ds
+
+    # 3. Apply the length filter *before* mapping
+    train_ds = filter_by_length(train_ds, "train")
+    eval_ds = filter_by_length(eval_ds, "eval")
+
+    if len(train_ds) == 0:
+        raise ValueError("No valid training samples found after length filtering!")
+
+    # --- THIS IS THE NEWLY ADDED BLOCK ---
+    # 4. Apply max_samples to the training set if specified
+    if max_samples > 0:
+        print(f"Subsampling training data from {len(train_ds)} down to {max_samples} samples.")
+        train_ds = train_ds.select(range(min(len(train_ds), max_samples)))
+    # --- END OF NEW BLOCK ---
+
+    if len(eval_ds) == 0:
+        print("Warning: No evaluation samples found after length filtering. Creating a small dummy eval set from train set.")
+        if len(train_ds) > 10:
+             eval_ds = train_ds.select(range(10)) # Create a small dummy eval set
+        else:
+             raise ValueError("Not enough training samples to create a dummy evaluation set.")
 
 
+    # 5. Define the mapping function for tokenization
     def map_and_tokenize_row(row: Dict[str, Any]) -> Dict[str, Any]:
         messages = build_messages_from_row(row)
         
-        # Ensure the conversation is a valid single-turn exchange
-        if not (len(messages) == 2 and messages[0]['role'] == 'user' and messages[1]['role'] == 'assistant'):
-            return {"input_ids": [], "labels": []}
+        prompt_text = tokenizer.apply_chat_template([messages[0]], tokenize=False, add_generation_prompt=True)
+        prompt_length = len(tokenizer(prompt_text, add_special_tokens=False)['input_ids'])
 
-        # 1. Create the prompt text by applying the template to the user message only.
-        #    `add_generation_prompt=True` tells the tokenizer to add the special tokens
-        #    that cue the assistant's response (e.g., for Qwen2, it adds `<|im_start|>assistant\n`).
-        #    This gives us the exact prefix that needs to be masked.
-        prompt_text = tokenizer.apply_chat_template(
-            [messages[0]],  # Only the user message
-            tokenize=False, 
-            add_generation_prompt=True
-        )
-        
-        # 2. Create the full conversation text, which includes the assistant's solution.
-        full_text = tokenizer.apply_chat_template(
-            messages, 
-            tokenize=False, 
-            add_generation_prompt=False
-        )
+        full_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
 
-        # 3. Tokenize the prompt text to find its length.
-        prompt_token_ids = tokenizer(prompt_text, add_special_tokens=False)['input_ids']
-        prompt_length = len(prompt_token_ids)
-
-        # 4. Tokenize the full text. This is what the model will actually see.
         tokenized = tokenizer(
             full_text,
             truncation=True,
@@ -148,41 +157,21 @@ def load_and_format_dataset(
             add_special_tokens=False,
         )
 
-        # 5. Create the labels and mask the prompt section.
-        #    The first `prompt_length` tokens correspond to the user message and the assistant cue.
-        labels = tokenized["input_ids"].copy()
+        labels = list(tokenized["input_ids"])
+        # labels[:prompt_length] = [-100] * min(prompt_length, len(labels))
         labels[:prompt_length] = [-100] * prompt_length
-        
         tokenized["labels"] = labels
         return tokenized
 
-
+    # 6. Map the tokenization function over the filtered and sampled data
     num_proc = min(os.cpu_count() - 2, 8) if os.cpu_count() > 4 else 1
-    print(f"Using {num_proc} processes for dataset mapping and tokenization")
+    print(f"Using {num_proc} processes for final dataset mapping and tokenization.")
 
     train_mapped = train_ds.map(map_and_tokenize_row, remove_columns=train_ds.column_names, num_proc=num_proc)
     eval_mapped = eval_ds.map(map_and_tokenize_row, remove_columns=eval_ds.column_names, num_proc=num_proc)
-
-    # filter short/empty
-    initial_train_size, initial_eval_size = len(train_mapped), len(eval_mapped)
-    train_mapped = train_mapped.filter(lambda ex: len(ex.get('input_ids', [])) > 16)
-    eval_mapped = eval_mapped.filter(lambda ex: len(ex.get('input_ids', [])) > 16)
-
-    print(f"Filtered out empty/short samples. Train: {initial_train_size} -> {len(train_mapped)}, "
-          f"Eval: {initial_eval_size} -> {len(eval_mapped)}")
-
-    if max_samples > 0:
-        train_mapped = train_mapped.select(range(min(len(train_mapped), max_samples)))
-
-    if len(train_mapped) == 0 or len(eval_mapped) == 0:
-        raise ValueError("No valid training or evaluation samples found after filtering!")
-
+    
     return train_mapped, eval_mapped
 
-
-import os
-import torch
-from peft import PeftModel
 
 def is_main_process():
     return int(os.environ.get("LOCAL_RANK", "0")) == 0
@@ -291,113 +280,104 @@ def consolidate_deepspeed_checkpoint(trainer, tokenizer, output_dir: str):
 
 
 # -------------------- Main --------------------
+# In train_qwen_think.py, replace the entire main() function with this.
+
 def main():
     check_environment()
 
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="Fine-tune a Qwen model for competitive programming.")
+    
+    # --- Core Paths ---
     p.add_argument("--model-name", default="Qwen/Qwen2.5-7B-Instruct")
     p.add_argument("--dataset-path", required=True)
-    p.add_argument("--output-dir", default="./qwen2-7b-codeforces-lora")
-    p.add_argument("--report-to", default="wandb", choices=["wandb", "none"])
-    p.add_argument("--max-seq-length", type=int, default=32768) #
+    p.add_argument("--output-dir", required=True)
+    
+    # --- Training Hyperparameters ---
+    p.add_argument("--num-train-epochs", type=float, default=3.0)
+    p.add_argument("--learning-rate", type=float, default=2e-5)
+    p.add_argument("--max-grad-norm", type=float, default=1.0)
+    p.add_argument("--warmup-ratio", type=float, default=0.03)
+
+    # --- Batching and Sequence Length ---
     p.add_argument("--per-device-train-batch-size", type=int, default=1)
     p.add_argument("--gradient-accumulation-steps", type=int, default=8)
-    p.add_argument("--deepspeed", default="deepspeed_zero2.json")
-    p.add_argument("--learning-rate", type=float, default=4e-5) #https://huggingface.co/blog/open-r1/update-3
-    p.add_argument("--num-train-epochs", type=float, default=3.0)
-    p.add_argument("--warmup-ratio", type=float, default=0.03)
-    p.add_argument("--eval-steps", type=int, default=2000)
-    p.add_argument("--save-strategy", type=str, default="epoch", choices=["steps", "epoch"], help="The checkpoint save strategy to use ('steps' or 'epoch').")
-    p.add_argument("--save-steps", type=int, default=0, help="Number of updates steps before two checkpoint saves if save_strategy='steps'. If 0, will default to every epoch.")
-    p.add_argument("--logging-steps", type=int, default=20)
-    p.add_argument("--validation-split-percentage", type=int, default=5)
-    p.add_argument("--early-stopping-patience", type=int, default=3)
-    p.add_argument("--use-lora", action="store_true", default=False) #Turn Lora off
-    p.add_argument("--lora-r", type=int, default=64)
-    p.add_argument("--lora-alpha", type=int, default=128)
-    p.add_argument("--lora-dropout", type=float, default=0.05)
-    p.add_argument("--max-train-samples", type=int, default=0)
-    p.add_argument("--wandb-project", default=None, help="(optional) wandb project name to report to")
-    p.add_argument("--disable-training-eval", action="store_true", default=True, help="Disable Trainer evaluation during training to save time")
-    p.add_argument("--single-arrow-file", type=str, default=None, help="Path to a single Arrow shard to load instead of the full dataset")
-    p.add_argument("--use-first-arrow-in-dir", action="store_true", default=False, help="If set, load the first data-*.arrow file under the dataset dir")
-    p.add_argument("--resume-from-checkpoint", type=str, default=None, help="Path to a checkpoint dir to resume from (e.g., output_dir/checkpoint-123 or 'last')")
+    p.add_argument("--max-seq-length", type=int, default=16384)
+
+    # --- Checkpointing and Logging ---
+    p.add_argument("--save-strategy", default="epoch", choices=["steps", "epoch"], help="Save checkpoints by 'epoch' or 'steps'.")
+    p.add_argument("--save-steps", type=int, default=0, help="If saving by steps, the step interval. If saving by epoch, this is ignored.")
+    p.add_argument("--save-total-limit", type=int, default=3)
+    p.add_argument("--logging-steps", type=int, default=10)
     
+    # --- System and DeepSpeed ---
+    p.add_argument("--deepspeed", type=str, default=None, help="Path to DeepSpeed config file.")
+    p.add_argument("--bf16_full_eval", action="store_true", help="Enable full evaluation in bf16 to save memory.")
+    p.add_argument("--report-to", default="wandb", choices=["wandb", "none"])
+    p.add_argument("--wandb-project", default="Mixture-of-Thoughts-Finetuning", help="WandB project name.")
+    
+    # --- Data Handling ---
+    p.add_argument("--validation-split-percentage", type=int, default=5)
+    p.add_argument("--max-train-samples", type=int, default=0, help="If set, subsample the training set.")
+    
+    # --- Resuming ---
+    p.add_argument("--resume-from-checkpoint", type=str, default=None, help="Path to checkpoint to resume from.")
+
     args = p.parse_args()
 
-    if args.report_to == "wandb":
-        os.environ["WANDB_PROJECT"] = "highqd-qwen-codeforces-finetune"
-
-    ensure_dir(args.output_dir)
-
-    print("Loading tokenizer...")
+    # --- Setup ---
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    # IMPORTANT: decoder-only models require left padding for correct generation
+    if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    print("Loading and formatting dataset...")
     train_dataset, eval_dataset = load_and_format_dataset(
-        args.dataset_path, tokenizer, args.validation_split_percentage,
-        max_seq_length=args.max_seq_length, max_samples=args.max_train_samples,
-        single_arrow_file=args.single_arrow_file, use_first_arrow_in_dir=args.use_first_arrow_in_dir
+        dataset_path=args.dataset_path,
+        tokenizer=tokenizer,
+        max_seq_length=args.max_seq_length,
+        validation_split_percentage=args.validation_split_percentage,
+        max_samples=args.max_train_samples,
     )
 
-    print("Loading model...")
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_name, trust_remote_code=True,
-        torch_dtype=torch.bfloat16, use_cache=False, attn_implementation="flash_attention_2"
+        args.model_name,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        use_cache=False,
+        attn_implementation="flash_attention_2"
     )
 
-    peft_config = None
-    if args.use_lora:
-        print("Configuring LoRA...")
-        peft_config = LoraConfig(
-            r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM",
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        )
-
-    # TrainingArguments tuned for stable fine-tune
-    do_eval = not args.disable_training_eval
-    eval_strategy_value = "steps" if do_eval else "no"
-    #load_best_value = True if do_eval else False
-    if args.save_strategy == "epoch" and args.save_steps == 0:
+    # --- Correctly handle save_steps logic ---
+    save_steps_value = args.save_steps
+    if args.save_strategy == "epoch":
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         updates_per_epoch = math.ceil(len(train_dataset) / (args.per_device_train_batch_size * world_size * args.gradient_accumulation_steps))
-        save_steps_val = updates_per_epoch
-        print(f"Save strategy is 'epoch', will save every {save_steps_val} steps.")
+        save_steps_value = updates_per_epoch
+        print(f"Save strategy is 'epoch', will save every {save_steps_value} steps.")
 
     training_args = TrainingArguments(
         output_dir=args.output_dir,
-        deepspeed=args.deepspeed if int(os.environ.get("WORLD_SIZE", "1")) > 1 else None,
-        bf16=True, do_train=True, do_eval=do_eval,
-        eval_strategy=eval_strategy_value, eval_steps=args.eval_steps,
-        save_strategy=args.save_strategy, save_steps=args.save_steps,
+        deepspeed=args.deepspeed,
+        bf16=True,
+        bf16_full_eval=args.bf16_full_eval,
+        do_train=True,
+        do_eval=False, # Keeping eval disabled for stability
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         gradient_checkpointing=True,
-        learning_rate=args.learning_rate, weight_decay=0.1,
-        warmup_ratio=args.warmup_ratio, lr_scheduler_type="cosine",
-        logging_steps=args.logging_steps,
-        save_total_limit=3,
-        load_best_model_at_end=False, #TODO load_best_value, metric_for_best_model="eval_loss", greater_is_better=False,
+        learning_rate=args.learning_rate,
+        lr_scheduler_type="cosine",
+        max_grad_norm=args.max_grad_norm,
         num_train_epochs=args.num_train_epochs,
+        warmup_ratio=args.warmup_ratio,
+        logging_steps=args.logging_steps,
+        save_strategy=args.save_strategy,
+        save_steps=save_steps_value, # <-- BUG FIX: Use the calculated value
+        save_total_limit=args.save_total_limit,
         report_to=args.report_to,
         remove_unused_columns=False,
-        dataloader_pin_memory=False,
     )
 
-    # Data collator that pads input_ids AND labels (label_pad_token_id=-100)
     data_collator = DataCollatorForSeq2Seq(
-        tokenizer,
-        model=model,
-        label_pad_token_id=-100,
-        pad_to_multiple_of=8
+        tokenizer, model=model, label_pad_token_id=-100, pad_to_multiple_of=8
     )
 
     trainer = SFTTrainer(
@@ -405,47 +385,14 @@ def main():
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        peft_config=peft_config,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience)] if do_eval else None,
         data_collator=data_collator,
     )
 
-    # Start training
-    try:
-        print("Starting training...")
-        resume_arg = None
-        if args.resume_from_checkpoint:
-            if args.resume_from_checkpoint.strip().lower() == "last":
-                # Find latest checkpoint-* under output_dir
-                ckpts = sorted(glob.glob(os.path.join(args.output_dir, "checkpoint-*")), key=lambda p: int(p.rsplit("-", 1)[-1]) if p.rsplit("-", 1)[-1].isdigit() else -1)
-                if ckpts:
-                    resume_arg = ckpts[-1]
-                    print(f"Resuming from last checkpoint: {resume_arg}")
-                else:
-                    print("No checkpoint-* directories found to resume from; starting fresh.")
-            else:
-                if os.path.isdir(args.resume_from_checkpoint):
-                    resume_arg = args.resume_from_checkpoint
-                    print(f"Resuming from checkpoint: {resume_arg}")
-                else:
-                    print(f"Provided --resume-from-checkpoint does not exist: {args.resume_from_checkpoint}. Starting fresh.")
-
-        trainer.train(resume_from_checkpoint=resume_arg)
-        print("Training completed successfully!")
-    except Exception as e:
-        print(f"Training failed with error: {e}")
-        raise
-
-    # Wait for all processes to finish training
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-
-    # The trainer has already saved the sharded checkpoint due to `save_steps=1`.
-    # Now, we just need to run our consolidation function on Rank 0.
-    consolidate_deepspeed_checkpoint(trainer, tokenizer, args.output_dir)
-
-    print("Script finished.")
-
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+    
+    # IMPROVEMENT: Pass the model directly, as that's all the function needs.
+    consolidate_deepspeed_checkpoint(trainer.model, tokenizer, args.output_dir)
 
 if __name__ == "__main__":
     main()
+
