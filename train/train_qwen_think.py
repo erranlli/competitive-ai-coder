@@ -326,7 +326,7 @@ def main():
     args = p.parse_args()
 
     if args.report_to == "wandb":
-        os.environ["WANDB_PROJECT"] = "qwen-codeforces-finetune"
+        os.environ["WANDB_PROJECT"] = "highqd-qwen-codeforces-finetune"
 
     ensure_dir(args.output_dir)
 

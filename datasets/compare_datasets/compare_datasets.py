@@ -12,7 +12,8 @@ from pygments.util import ClassNotFound
 import re
 
 # --- Configuration ---
-DATASET_A_PATH = "/mnt/data2/filtered_datasets_flexible_match/successful_solutions"
+#DATASET_A_PATH = "/mnt/data2/filtered_datasets_flexible_match/successful_solutions"
+DATASET_A_PATH = "/mnt/data2/codeforces_cots_high_quality.arrow"
 #DATASET_B_PATH = "/mnt/data2/new_deepcoder_cots_arrow_codeonly"
 DATASET_B_PATH = "/mnt/data2/new_deepcoder_cots_arrow_appexp"
 NUM_SAMPLES_TO_PRINT = 3
