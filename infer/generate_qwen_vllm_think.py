@@ -1,37 +1,28 @@
+#!/usr/bin/env python3
 import argparse
 import json
 import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Tuple, Optional
+from pathlib import Path
+from typing import Any, Dict, Iterable, List
 
 from datasets import load_dataset
 from tqdm import tqdm
 
-# Ensure repository root is on sys.path for local package imports
+# Ensure local package imports work
 _CUR_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_CUR_DIR, ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from transformers import AutoTokenizer, AutoConfig
+from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
-from model_util.file_util import (
-    ensure_dir,
-    resolve_outfile,
-    prepare_model_dir as resolve_model_dir,
-)
-from model_util.text_util import (
-    normalize_text,
-    extract_code_from_text,
-)
-from model_util.model_util import (
-    get_model_config_fields,
-    detect_model_type,
-    load_tokenizer,
-)
+from model_util.file_util import ensure_dir, resolve_outfile, prepare_model_dir as resolve_model_dir
+from model_util.text_util import normalize_text, extract_code_from_text
+from model_util.model_util import get_model_config_fields, detect_model_type, load_tokenizer
 
 try:
     from deepspeed.utils.zero_to_fp32 import convert_zero_checkpoint_to_fp32_state_dict as ds_convert
@@ -39,22 +30,8 @@ except Exception:
     ds_convert = None
 
 
-def build_prompt_from_row(
-    row: Dict[str, Any], 
-    enable_thinking: bool = True,
-    model_name: str = "",
-    use_livecodebench_style: bool = False
-) -> str:
-    """
-    Build a prompt for Codeforces problems with model-specific optimizations.
-    
-    Args:
-        row: Dictionary containing problem data
-        enable_thinking: Whether thinking is enabled globally
-        model_name: Model name for type detection
-        use_livecodebench_style: Whether to use LiveCodeBench-style formatting
-    """
-    # Extract problem components
+def build_prompt_from_row(row: Dict[str, Any], enable_thinking: bool, model_name: str, use_livecodebench_style: bool) -> str:
+    """Build prompt for Codeforces problem."""
     title = row.get("title") or row.get("id") or "Codeforces Problem"
     description = row.get("description", "")
     input_format = row.get("input_format", "")
@@ -64,25 +41,17 @@ def build_prompt_from_row(
     tags = row.get("tags", [])
     time_limit = row.get("time_limit", "")
     memory_limit = row.get("memory_limit", "")
-    
+
     if use_livecodebench_style:
-        # LiveCodeBench style prompt
         problem_text = description.strip()
-        
-        # Add input/output format inline
         if input_format:
             problem_text += f"\n\nInput Format:\n{input_format.strip()}"
-        
         if output_format:
             problem_text += f"\n\nOutput Format:\n{output_format.strip()}"
-        
         if note:
             problem_text += f"\n\n{note.strip()}"
-        
-        # Add tags and limits if available
         if tags:
             problem_text += f"\n\nTags:\n{tags}"
-        
         if time_limit or memory_limit:
             limits = []
             if time_limit:
@@ -90,8 +59,7 @@ def build_prompt_from_row(
             if memory_limit:
                 limits.append(f"Memory Limit: {memory_limit}")
             problem_text += f"\n{' | '.join(limits)}"
-        
-        # LiveCodeBench-style instruction
+
         instruction = (
             "### Format: Read the inputs from stdin solve the problem and write the answer to stdout "
             "(do not directly test on the sample inputs). Enclose your code within delimiters as follows. "
@@ -101,68 +69,49 @@ def build_prompt_from_row(
             "```\n\n"
             "### Answer: (use the provided format with backticks)"
         )
-        
-        return f"You are an expert Python programmer. You will be given a question (problem specification) and will generate a correct Python program that matches the specification and passes all tests.\n\n\n{problem_text}\n{instruction}"
-    
-    else:
-        # Training-style prompt matching user's fine-tune instruction (sections and fenced examples)
-        def fmt_limits(val, unit):
-            try:
-                v = float(val)
-                if v.is_integer():
-                    return f"{int(v)} {unit}"
-                return f"{v} {unit}"
-            except Exception:
-                return f"{val} {unit}" if val else ""
+        return f"You are an expert Python programmer. You will be given a question (problem specification) and will generate a correct Python program.\n\n{problem_text}\n{instruction}"
 
+    # Default: instruction-tuned prompt
+    prompt_parts: List[str] = []
+    prompt_parts.append(
+        "You will be given a competitive programming problem.\n"
+        "Analyze maximum input constraints and identify optimal algorithm/data structures. "
+        "Provide a complete Python3 implementation optimized for speed and memory.\n\n"
+        "Your solution must read input from standard input and write output to stdout.\n\n"
+        "Put your final solution within a single code block:\n"
+        "```python\n<your code here>\n```"
+    )
+    prompt_parts.append("\n# Problem\n\n" + (description or "").strip())
+
+    constraints_lines: List[str] = ["## Constraints"]
+    constraints_lines.append(f"Time limit per test: {time_limit or '2.0 seconds'}")
+    constraints_lines.append(f"Memory limit per test: {memory_limit or '256.0 megabytes'}")
+    prompt_parts.append("\n" + "\n".join(constraints_lines))
+
+    if input_format:
+        prompt_parts.append("\n## Input Format\n" + input_format.strip())
+    if output_format:
+        prompt_parts.append("\n## Output Format\n" + output_format.strip())
+
+    if examples:
         ex_lines: List[str] = []
-        if isinstance(examples, list) and len(examples) > 0:
-            for idx, ex in enumerate(examples):
-                ex_in = (ex.get("input") or "").strip()
-                ex_out = (ex.get("output") or "").strip()
-                if ex_in or ex_out:
-                    ex_lines.append("```input\n" + ex_in + "\n```")
-                    ex_lines.append("```output\n" + ex_out + "\n```")
-                    if idx != len(examples) - 1:
-                        ex_lines.append("-----")
-        examples_block = "\n".join(ex_lines)
+        for idx, ex in enumerate(examples):
+            ex_in = (ex.get("input") or "").strip()
+            ex_out = (ex.get("output") or "").strip()
+            if ex_in or ex_out:
+                ex_lines.append("```input\n" + ex_in + "\n```")
+                ex_lines.append("```output\n" + ex_out + "\n```")
+                if idx != len(examples) - 1:
+                    ex_lines.append("-----")
+        prompt_parts.append("\n## Examples\n" + "\n".join(ex_lines))
+    if note:
+        prompt_parts.append("\n## Note\n" + note.strip())
 
-        tl = fmt_limits(time_limit, "seconds") if time_limit else "2.0 seconds"
-        ml = fmt_limits(memory_limit, "megabytes") if memory_limit else "256.0 megabytes"
-
-        prompt_parts: List[str] = []
-        prompt_parts.append(
-            "You will be given a competitive programming problem.\n"
-            "Analyze the maximum input constraints and identify the optimal algorithmic approach and data structures needed to process the largest possible test cases within the time and memory limits, then explain why your chosen implementation strategy is the most efficient solution. Please reason step by step about your solution approach, then provide a complete implementation in Python 3 that is thoroughly optimized for both speed and memory usage.\n\n"
-            "Your solution must read input from standard input (input()), write output to standard output (print()).\n"
-            "Do not include any debug prints or additional output.\n\n"
-            "Put your final solution within a single code block:\n"
-            "```python\n"
-            "<your code here>\n"
-            "```"
-        )
-        prompt_parts.append("\n# Problem\n\n" + (description or "").strip())
-
-        constraints_lines: List[str] = ["## Constraints"]
-        constraints_lines.append(f"Time limit per test: {tl}")
-        constraints_lines.append(f"Memory limit per test: {ml}")
-        prompt_parts.append("\n" + "\n".join(constraints_lines))
-
-        if input_format:
-            prompt_parts.append("\n## Input Format\n" + input_format.strip())
-        if output_format:
-            prompt_parts.append("\n## Output Format\n" + output_format.strip())
-        if examples_block:
-            prompt_parts.append("\n## Examples\n" + examples_block)
-        if note:
-            prompt_parts.append("\n## Note\n" + note.strip())
-
-        return "\n\n".join([p for p in prompt_parts if normalize_text(p)])
+    return "\n\n".join([p for p in prompt_parts if normalize_text(p)])
 
 
 @dataclass
 class GenConfig:
-    """Configuration for the generation script."""
     dataset_name: str
     subset: str
     split: str
@@ -183,34 +132,19 @@ class GenConfig:
     max_problems: int
     gpu_memory_utilization: float
     enable_thinking: bool
-    use_livecodebench_style: bool  # New parameter
-    # Decoding controls
-    # no_repeat_ngram_size: int = 6
+    use_livecodebench_style: bool
     repetition_penalty: float = 1.1
-    stop: str = ""  # comma-separated list; defaults applied if empty
+    stop: str = ""
 
 
-def apply_chat_template(tokenizer: Any, user_prompt: str, enable_thinking: bool) -> str:
-    """Apply chat template with optional thinking capability.
-
-    When thinking is disabled, avoid injecting a system message to better match
-    instruction-tuned training prompts (single user message).
-    """
+def apply_chat_template(tokenizer, user_prompt: str, enable_thinking: bool) -> str:
     if enable_thinking:
         messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a helpful assistant. You are capable of thinking, reasoning, and planning. "
-                    "You can express your thoughts within <think> and </think> tags."
-                ),
-            },
+            {"role": "system", "content": "You are a helpful assistant capable of reasoning with <think> tags."},
             {"role": "user", "content": user_prompt},
         ]
     else:
-        messages = [
-            {"role": "user", "content": user_prompt}
-        ]
+        messages = [{"role": "user", "content": user_prompt}]
     try:
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     except Exception:
@@ -223,7 +157,6 @@ def chunked(iterable: List[Any], n: int) -> Iterable[List[Any]]:
 
 
 def load_rows(cfg: GenConfig) -> List[Dict[str, Any]]:
-    """Load dataset rows with filtering."""
     ds = load_dataset(cfg.dataset_name, split=cfg.split, name=cfg.subset)
     rows: List[Dict[str, Any]] = []
     for row in ds:
@@ -236,12 +169,8 @@ def load_rows(cfg: GenConfig) -> List[Dict[str, Any]]:
 
 
 def generate_with_vllm(cfg: GenConfig) -> str:
-    """Main function to configure vLLM and run generation."""
     ensure_dir(cfg.results_dir)
-    out_path = os.path.join(cfg.results_dir, cfg.outfile or resolve_outfile(
-        cfg.model_name, cfg.dataset_name, cfg.subset, cfg.split
-    ))
-    
+    out_path = os.path.join(cfg.results_dir, cfg.outfile or resolve_outfile(cfg.model_name, cfg.dataset_name, cfg.subset, cfg.split))
     with open(out_path, "w", encoding="utf-8") as f:
         pass
 
@@ -251,8 +180,7 @@ def generate_with_vllm(cfg: GenConfig) -> str:
         return out_path
 
     print(f"Loaded {len(rows)} problems from {cfg.dataset_name}:{cfg.subset}:{cfg.split}")
-    
-    # Show prompt configuration
+
     model_type = detect_model_type(cfg.model_name)
     print(f"Model type detected: {model_type}")
     print(f"Thinking enabled: {cfg.enable_thinking}")
@@ -260,160 +188,96 @@ def generate_with_vllm(cfg: GenConfig) -> str:
 
     if cfg.gpu_ids:
         os.environ["CUDA_VISIBLE_DEVICES"] = cfg.gpu_ids
-    
-    num_visible_gpus = len(os.environ.get("CUDA_VISIBLE_DEVICES", "").split(',')) if os.environ.get("CUDA_VISIBLE_DEVICES") else 1
+    num_visible_gpus = len(os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")) if os.environ.get("CUDA_VISIBLE_DEVICES") else 1
 
-    # use shared latest_checkpoint()
+    model_dir = Path(cfg.checkpoint_path)
+    if (model_dir / "model.safetensors.index.json").exists():
+        print("Detected sharded model.")
+        model_to_use = str(model_dir)
+        # Ensure TP divides the total number of attention heads
+        chosen_tp = min(cfg.tensor_parallel_size, num_visible_gpus)
+        # Adjust if necessary
+        if model_type == "qwen2.5" and chosen_tp > 4:
+            print("Reducing tensor_parallel_size to 4 to match 28 attention heads")
+            chosen_tp = 4
+    else:
+        model_to_use = resolve_model_dir(cfg.checkpoint_path, cfg.model_name, ds_convert)
+        chosen_tp = min(cfg.tensor_parallel_size, num_visible_gpus)
 
+    print(f"Using model: {model_to_use} | TP={chosen_tp}")
 
-    model_to_use = resolve_model_dir(cfg.checkpoint_path, cfg.model_name, ds_convert)
-    print(f"Using model: {model_to_use}")
-
-    num_heads, num_kv_heads, model_max_len = get_model_config_fields(model_to_use)
-    
-    # *** AUTOMATIC CONTEXT LENGTH OVERRIDE ***
-    if model_max_len > 0 and cfg.max_model_len > model_max_len:
-        print(f"Warning: --max-model-len ({cfg.max_model_len}) exceeds the model's architectural limit ({model_max_len}).")
-        print("Setting VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 to allow this override.")
-        os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
-
-    max_tp = min(cfg.tensor_parallel_size, num_visible_gpus)
-    chosen_tp = 1
-    for tp in range(max_tp, 0, -1):
-        if num_heads > 0 and num_heads % tp == 0 and (num_kv_heads is None or num_kv_heads == 0 or num_kv_heads % tp == 0):
-            chosen_tp = tp
-            break
-    
-    print(
-        f"Model heads={num_heads or 'N/A'}, kv_heads={num_kv_heads or 'N/A'} | "
-        f"Visible GPUs={num_visible_gpus} | "
-        f"Requested TP={cfg.tensor_parallel_size} -> Using TP={chosen_tp}"
-    )
-
-    # Initialize LLM engine
     llm = LLM(
         model=model_to_use,
-        trust_remote_code=True,
         tensor_parallel_size=chosen_tp,
         max_model_len=cfg.max_model_len,
         dtype=cfg.dtype,
-        seed=cfg.seed,
         gpu_memory_utilization=cfg.gpu_memory_utilization,
-        enable_prefix_caching=bool(cfg.enable_thinking),
+        enable_prefix_caching=True,
+        seed=cfg.seed,
     )
 
-    # Build stop sequences (CLI or env). Default: no stops
-    stop_list = None
-    if getattr(cfg, "stop", ""):
-        stop_list = [s for s in cfg.stop.split(",") if s]
-    if stop_list is None:
-        env_stop = os.environ.get("VLLM_STOP_OVERRIDES", "")
-        if env_stop:
-            parsed = [s for s in env_stop.split(",") if s]
-            stop_list = parsed if parsed else None
+    stop_list = [s for s in cfg.stop.split(",") if s] if cfg.stop else None
+    sampling_params = SamplingParams(
+        temperature=cfg.temperature,
+        top_p=cfg.top_p,
+        max_tokens=cfg.max_new_tokens,
+        repetition_penalty=cfg.repetition_penalty,
+        stop=stop_list,
+    )
 
-    # Construct SamplingParams with broad compatibility across vLLM versions
-    try:
-        sampling_params = SamplingParams(
-            temperature=cfg.temperature,
-            top_p=cfg.top_p,
-            max_tokens=cfg.max_new_tokens,
-            stop=stop_list,
-            repetition_penalty=cfg.repetition_penalty,
-        )
-    except TypeError:
-        # Fallback without repetition_penalty for older vLLM versions
-        sampling_params = SamplingParams(
-            temperature=cfg.temperature,
-            top_p=cfg.top_p,
-            max_tokens=cfg.max_new_tokens,
-            stop=stop_list,
-        )
-    
     tokenizer = load_tokenizer(cfg.model_name)
-    
     pbar = tqdm(total=len(rows), desc="Processing prompts")
+
     for batch in chunked(rows, cfg.batch_size):
-        prompts = [
-            apply_chat_template(
-                tokenizer, 
-                build_prompt_from_row(
-                    row, 
-                    cfg.enable_thinking, 
-                    cfg.model_name,
-                    cfg.use_livecodebench_style
-                ), 
-                cfg.enable_thinking
-            ) 
-            for row in batch
-        ]
+        prompts = [apply_chat_template(tokenizer, build_prompt_from_row(row, cfg.enable_thinking, cfg.model_name, cfg.use_livecodebench_style), cfg.enable_thinking) for row in batch]
         ids = [row.get("id") or (row.get("contest_id", "") + "/" + row.get("index", "")) for row in batch]
-        
-        # Generate responses using synchronous LLM.generate
+
         outputs = llm.generate(prompts, sampling_params)
-        
+
         with open(out_path, "a", encoding="utf-8") as w:
             for i, output in enumerate(outputs):
-                # Get the generated text from the first (and typically only) completion
                 raw_response = output.outputs[0].text if output.outputs else ""
                 code_text = extract_code_from_text(raw_response, language_hint="python")
-                rec = {
-                    "id": ids[i],
-                    "model": cfg.model_name,
-                    "raw_response": raw_response,
-                    "code": code_text,
-                    "timestamp": time.time(),
-                }
+                rec = {"id": ids[i], "model": cfg.model_name, "raw_response": raw_response, "code": code_text, "timestamp": time.time()}
                 w.write(json.dumps(rec) + "\n")
-        
-        pbar.update(len(batch))
 
+        pbar.update(len(batch))
     pbar.close()
     return out_path
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Generate Codeforces solutions with vLLM")
-    
     p.add_argument("--dataset-name", default="open-r1/codeforces")
     p.add_argument("--subset", default="default")
     p.add_argument("--split", default="test")
     p.add_argument("--model-name", default="Qwen/Qwen3-8B")
     p.add_argument("--checkpoint-path", default="", help="Path to fine-tuned checkpoint")
-    
     p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--max-model-len", type=int, default=38912, help="Max sequence length. Automatically handles overrides for models like Qwen3.")
+    p.add_argument("--max-model-len", type=int, default=38912)
     p.add_argument("--max-new-tokens", type=int, default=32768)
     p.add_argument("--tensor-parallel-size", type=int, default=8)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.95)
-    
     p.add_argument("--temperature", type=float, default=0.6)
     p.add_argument("--top-p", type=float, default=0.95)
-    #p.add_argument("--no-repeat-ngram-size", type=int, default=6)
     p.add_argument("--repetition-penalty", type=float, default=1.1)
-    p.add_argument("--stop", type=str, default="", help="Comma-separated stop sequences; default to \n## Explanation")
+    p.add_argument("--stop", type=str, default="")
     p.add_argument("--seed", type=int, default=0)
-    
-    p.add_argument("--enable-thinking", action="store_true", help="Enable thinking mode with <think> tags")
-    p.add_argument("--use-livecodebench-style", action="store_true", help="Use LiveCodeBench-style prompt formatting")
-    
+    p.add_argument("--enable-thinking", action="store_true")
+    p.add_argument("--use-livecodebench-style", action="store_true")
     p.add_argument("--gpu-ids", default="0,1,2,3,4,5,6,7")
     p.add_argument("--dtype", default="auto", choices=["auto", "float16", "bfloat16", "float32"])
     p.add_argument("--results-dir", default="./solutions")
     p.add_argument("--outfile", default="")
     p.add_argument("--max-problems", type=int, default=0)
     p.add_argument("--skip-non-stdio", action=argparse.BooleanOptionalAction, default=True)
-    
-    # Default: disable thinking to reduce verbosity for instruction-tuned code models
-    p.set_defaults(enable_thinking=False, use_livecodebench_style=False)
     return p
 
 
-def main() -> None:
+def main():
     parser = build_arg_parser()
     args = parser.parse_args()
     cfg = GenConfig(**vars(args))
-    
     generate_with_vllm(cfg)
 
 
