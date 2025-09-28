@@ -11,7 +11,7 @@ import shutil
 from deepspeed.utils.zero_to_fp32 import convert_zero_checkpoint_to_fp32_state_dict
 
 import torch
-from datasets import load_from_disk, Dataset
+from datasets import load_dataset, load_from_disk, Dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -77,7 +77,9 @@ def load_and_format_dataset(
     Loads, splits, filters by token length, sub-samples, and tokenizes the dataset.
     """
     print(f"Loading dataset from local path: {dataset_path}")
-    ds = load_from_disk(dataset_path)
+    #ds = load_from_disk(dataset_path)
+    ds = load_dataset("arrow", data_files=os.path.join(dataset_path, "*.arrow"))
+
 
     # 1. Handle dataset splitting
     if isinstance(ds, dict):
@@ -109,7 +111,7 @@ def load_and_format_dataset(
             try:
                 full_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
                 tokenized = tokenizer(full_text, add_special_tokens=False)
-                if len(tokenized["input_ids"]) <= max_seq_length:
+                if 16 < len(tokenized["input_ids"]) <= max_seq_length:
                     filtered_indices.append(i)
             except Exception:
                 continue
@@ -294,26 +296,26 @@ def main():
     
     # --- Training Hyperparameters ---
     p.add_argument("--num-train-epochs", type=float, default=3.0)
-    p.add_argument("--learning-rate", type=float, default=2e-5)
+    p.add_argument("--learning-rate", type=float, default=4e-5)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--warmup-ratio", type=float, default=0.03)
 
     # --- Batching and Sequence Length ---
     p.add_argument("--per-device-train-batch-size", type=int, default=1)
     p.add_argument("--gradient-accumulation-steps", type=int, default=8)
-    p.add_argument("--max-seq-length", type=int, default=16384)
+    p.add_argument("--max-seq-length", type=int, default=16384) #TODO
 
     # --- Checkpointing and Logging ---
     p.add_argument("--save-strategy", default="epoch", choices=["steps", "epoch"], help="Save checkpoints by 'epoch' or 'steps'.")
     p.add_argument("--save-steps", type=int, default=0, help="If saving by steps, the step interval. If saving by epoch, this is ignored.")
-    p.add_argument("--save-total-limit", type=int, default=3)
+    p.add_argument("--save-total-limit", type=int, default=50) #Erran TODO
     p.add_argument("--logging-steps", type=int, default=10)
     
     # --- System and DeepSpeed ---
     p.add_argument("--deepspeed", type=str, default=None, help="Path to DeepSpeed config file.")
     p.add_argument("--bf16_full_eval", action="store_true", help="Enable full evaluation in bf16 to save memory.")
     p.add_argument("--report-to", default="wandb", choices=["wandb", "none"])
-    p.add_argument("--wandb-project", default="Mixture-of-Thoughts-Finetuning", help="WandB project name.")
+    p.add_argument("--wandb-project", default="new-ft-qwen2.5-mot", help="WandB project name.")
     
     # --- Data Handling ---
     p.add_argument("--validation-split-percentage", type=int, default=5)

@@ -1,6 +1,6 @@
 import os
 import difflib
-from datasets import load_from_disk
+from datasets import load_from_disk, load_dataset
 import textwrap
 import numpy as np
 from transformers import AutoTokenizer
@@ -13,9 +13,9 @@ import re
 
 # --- Configuration ---
 #DATASET_A_PATH = "/mnt/data2/filtered_datasets_flexible_match/successful_solutions"
-DATASET_A_PATH = "/mnt/data2/codeforces_cots_high_quality.arrow"
+DATASET_A_PATH = "/mnt/data2/.cache/datasets/erranli___codeforces-cot-highquality/default/0.0.0/e3c476aec91f0a71ee6596c613d4eba4317b6a80"
 #DATASET_B_PATH = "/mnt/data2/new_deepcoder_cots_arrow_codeonly"
-DATASET_B_PATH = "/mnt/data2/new_deepcoder_cots_arrow_appexp"
+DATASET_B_PATH = DATASET_A_PATH #"/mnt/data2/new_deepcoder_cots_arrow_appexp"
 NUM_SAMPLES_TO_PRINT = 3
 TOKENIZER_NAME = "Qwen/Qwen2.5-7B-Instruct"
 
@@ -84,8 +84,14 @@ def main():
     """
     print("Loading datasets...")
     try:
-        ds_a = load_from_disk(DATASET_A_PATH, keep_in_memory=False)
-        ds_b = load_from_disk(DATASET_B_PATH, keep_in_memory=False)
+        # Load dataset from HuggingFace hub directly
+        print("Loading from HuggingFace hub: erranli/codeforces-cot-highquality")
+        ds_a_dict = load_dataset("erranli/codeforces-cot-highquality")
+        ds_a = ds_a_dict['train']
+        
+        # For now, use the same dataset for both A and B (as specified in config)
+        ds_b = ds_a
+            
     except Exception as e:
         print(f"Error loading datasets: {e}")
         return

@@ -41,12 +41,19 @@ Key options:
 If you deploy your own server, raise payload/time/memory limits. Example approach with Piston:
 
 ```bash
-git clone https://github.com/engineer-man/piston
-cd piston
+
+cd eval/piston_setup
+docker pull ghcr.io/engineer-man/piston:latest
 docker build -t piston-fixed .
 docker stop piston_api || true && docker rm piston_api || true
 docker run --privileged -dit -p 2000:2000 --name piston_api --env-file ./piston.env piston-fixed
-cli/index.js ppman install python
+
+git clone https://github.com/engineer-man/piston
+sudo apt install npm
+# Start the API container
+docker-compose up -d api
+# Install all the dependencies for the cli
+cd cli && npm i && cd -cli/index.js ppman install python
 ```
 
 Even with relaxed limits, keep the stdin-as-file workaround in place for robustness.

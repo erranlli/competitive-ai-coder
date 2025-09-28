@@ -194,17 +194,17 @@ def generate_with_vllm(cfg: GenConfig) -> str:
     if (model_dir / "model.safetensors.index.json").exists():
         print("Detected sharded model.")
         model_to_use = str(model_dir)
-        # Ensure TP divides the total number of attention heads
-        chosen_tp = min(cfg.tensor_parallel_size, num_visible_gpus)
-        # Adjust if necessary
-        if model_type == "qwen2.5" and chosen_tp > 4:
-            print("Reducing tensor_parallel_size to 4 to match 28 attention heads")
-            chosen_tp = 4
     else:
         model_to_use = resolve_model_dir(cfg.checkpoint_path, cfg.model_name, ds_convert)
-        chosen_tp = min(cfg.tensor_parallel_size, num_visible_gpus)
 
-    print(f"Using model: {model_to_use} | TP={chosen_tp}")
+    chosen_tp = min(cfg.tensor_parallel_size, num_visible_gpus)
+
+    # For qwen2.5, the max tensor parallel size that satisfies both attention head (28)
+    # and vocab size (152064) divisibility is 4. We must cap it at 4.
+    if model_type == "qwen2.5" and chosen_tp > 4:
+        print(f"Warning: For Qwen2.5, tensor parallel size must be <= 4. "
+              f"Reducing from {chosen_tp} to 4.")
+        chosen_tp = 4
 
     llm = LLM(
         model=model_to_use,

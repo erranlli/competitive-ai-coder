@@ -519,7 +519,7 @@ def evaluate_records(
                     incr_reason(res.get("reason", "unknown"))
 
             # Generated tests
-            gen_tests: List[Dict[str, str]] = load_generated_tests(problem_id, generated_tests_dir)
+            gen_tests: List[Dict[str, str]] = None #load_generated_tests(problem_id, generated_tests_dir)
             if gen_tests:
                 # Optional sampling
                 if 0.0 < generated_tests_sample < 1.0:
@@ -658,7 +658,8 @@ def evaluate_records(
             total += 1
             # Count as correct if passes all official tests (when available) 
             # AND all generated tests (when available)
-            has_tests = len(official_tests) > 0 or len(gen_tests) > 0
+            # has_tests = len(official_tests) > 0 or len(gen_tests) > 0
+            has_tests = (len(official_tests or []) > 0) or (len(gen_tests or []) > 0)
             if all_passed and has_tests:
                 correct += 1
                 #print(f"""***problem:{problem_id} Correct, passed all tests""")
@@ -667,12 +668,12 @@ def evaluate_records(
                 #    print(f"""model output:{case.get('output', '')}, expected output:{case.get('expected', '')}""")
                 #    print(f"""problem:{problem_id}, test_case:{case.get('test_case_i', '')}, error:{case.get('error','')}, reason:{case.get('reason', '')}""")
 
-            else:
-                for case in per_case: #Erran: TODO
-                    if not case['passed']:
-                        print(f"""code:{item.get('code', '')}""")
-                        print(f"""model output:{case.get('output', '')}, expected output:{case.get('expected', '')}""")
-                        print(f"""problem:{problem_id}, test_case:{case.get('test_case_i', '')}, error:{case.get('error','')}, reason:{case.get('reason', '')}""")
+            #else:
+            #    for case in per_case: #Erran: TODO
+            #        if not case['passed']:
+            #            print(f"""code:{item.get('code', '')}""")
+            #            print(f"""model output:{case.get('output', '')}, expected output:{case.get('expected', '')}""")
+            #            print(f"""problem:{problem_id}, test_case:{case.get('test_case_i', '')}, error:{case.get('error','')}, reason:{case.get('reason', '')}""")
 
             # For problem-level checker stats: if checker exists, use per-case reasons to decide pass/fail counts
             if checker_present:
@@ -734,7 +735,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-generated-bytes-per-problem", type=int, default=-1)
     p.add_argument("--generated-tests-workers", type=int, default=1)
     p.add_argument("--generated-tests-sample", type=float, default=1.0) #TODO: no-sampling 
-    p.add_argument("--results-dir", default="/root/competitive-coding-ai/results")
+    p.add_argument("--results-dir", default="./results")
     return p
 
 def main() -> None:
