@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# improved_finetune_qwen_codeforces.py
+# improved_finetune_qwen_codeforces_instrumented.py
 import argparse
 import os
 import gc
@@ -62,24 +62,18 @@ def apply_chat_template(tokenizer: AutoTokenizer, messages: List[Dict[str, str]]
         return "\n".join(parts)
 
 # --- Dataset loader + tokenizer mapping (with label masking) ---
-# In your train_qwen_think.py script:
-# DELETE the existing load_and_format_dataset function and REPLACE it with this.
-# In your training script:
-# DELETE the existing load_and_format_dataset function and REPLACE it with this.
 def load_and_format_dataset(
     dataset_path: str,
     tokenizer: AutoTokenizer,
     max_seq_length: int,
     validation_split_percentage: int,
-    max_samples: int = 0, # Added max_samples back
+    max_samples: int = 0,
 ) -> Tuple[Dataset, Dataset]:
     """
     Loads, splits, filters by token length, sub-samples, and tokenizes the dataset.
     """
     print(f"Loading dataset from local path: {dataset_path}")
-    #ds = load_from_disk(dataset_path)
     ds = load_dataset("arrow", data_files=os.path.join(dataset_path, "*.arrow"))
-
 
     # 1. Handle dataset splitting
     if isinstance(ds, dict):
@@ -99,10 +93,10 @@ def load_and_format_dataset(
         initial_count = len(dataset_split)
         if initial_count == 0:
             return dataset_split
-        
+
         filtered_indices = []
         print(f"Filtering {split_name} dataset by token length (<= {max_seq_length})...")
-        
+
         for i, row in enumerate(tqdm(dataset_split, desc=f"Scanning {split_name} for length")):
             messages = build_messages_from_row(row)
             if not (len(messages) == 2 and messages[0]['role'] == 'user'):
@@ -115,7 +109,7 @@ def load_and_format_dataset(
                     filtered_indices.append(i)
             except Exception:
                 continue
-        
+
         filtered_ds = dataset_split.select(filtered_indices)
         print(f"Length filter for {split_name}: Kept {len(filtered_ds)} of {initial_count} samples.")
         return filtered_ds
@@ -127,25 +121,22 @@ def load_and_format_dataset(
     if len(train_ds) == 0:
         raise ValueError("No valid training samples found after length filtering!")
 
-    # --- THIS IS THE NEWLY ADDED BLOCK ---
-    # 4. Apply max_samples to the training set if specified
+    # --- max_samples block ---
     if max_samples > 0:
         print(f"Subsampling training data from {len(train_ds)} down to {max_samples} samples.")
         train_ds = train_ds.select(range(min(len(train_ds), max_samples)))
-    # --- END OF NEW BLOCK ---
 
     if len(eval_ds) == 0:
         print("Warning: No evaluation samples found after length filtering. Creating a small dummy eval set from train set.")
         if len(train_ds) > 10:
-             eval_ds = train_ds.select(range(10)) # Create a small dummy eval set
+             eval_ds = train_ds.select(range(10))
         else:
              raise ValueError("Not enough training samples to create a dummy evaluation set.")
-
 
     # 5. Define the mapping function for tokenization
     def map_and_tokenize_row(row: Dict[str, Any]) -> Dict[str, Any]:
         messages = build_messages_from_row(row)
-        
+
         prompt_text = tokenizer.apply_chat_template([messages[0]], tokenize=False, add_generation_prompt=True)
         prompt_length = len(tokenizer(prompt_text, add_special_tokens=False)['input_ids'])
 
@@ -160,7 +151,6 @@ def load_and_format_dataset(
         )
 
         labels = list(tokenized["input_ids"])
-        # labels[:prompt_length] = [-100] * min(prompt_length, len(labels))
         labels[:prompt_length] = [-100] * prompt_length
         tokenized["labels"] = labels
         return tokenized
@@ -171,7 +161,7 @@ def load_and_format_dataset(
 
     train_mapped = train_ds.map(map_and_tokenize_row, remove_columns=train_ds.column_names, num_proc=num_proc)
     eval_mapped = eval_ds.map(map_and_tokenize_row, remove_columns=eval_ds.column_names, num_proc=num_proc)
-    
+
     return train_mapped, eval_mapped
 
 
@@ -209,7 +199,6 @@ def consolidate_deepspeed_checkpoint(trainer, tokenizer, output_dir: str):
 
     print("\n--- [Rank 0] Starting Final Model Consolidation ---")
 
-    # Step 1: Find the latest checkpoint directory created by the Trainer.
     checkpoints = sorted(
         glob.glob(os.path.join(output_dir, "checkpoint-*")),
         key=lambda p: int(p.rsplit("-", 1)[-1])
@@ -217,23 +206,15 @@ def consolidate_deepspeed_checkpoint(trainer, tokenizer, output_dir: str):
     if not checkpoints:
         print(f"FATAL ERROR: No checkpoint directory found in {output_dir}. Cannot consolidate.")
         return
-    
+
     latest_checkpoint_dir = checkpoints[-1]
     print(f"Found latest checkpoint directory to convert: {latest_checkpoint_dir}")
 
-    # Step 2: The DeepSpeed utility needs a "tag" which corresponds to the step number.
-    # This is used to find the "global_stepX" folder inside the checkpoint dir.
-    # Prefer 'latest' tag in the checkpoint dir; DS utility will read it if tag is None
     tag = None
     print("Using checkpoint tag from 'latest' file (DeepSpeed will auto-detect).")
-    
-    # Step 3: We will write weights into the output_dir (not a file path).
     print(f"Consolidated model weights will be saved under: {output_dir}")
-
-    # Step 4: Run the DeepSpeed conversion utility. This is the critical step.
     print("Running DeepSpeed's conversion script...")
     try:
-        # Run conversion: second arg must be a directory; utility writes files inside it
         convert_zero_checkpoint_to_fp32_state_dict(latest_checkpoint_dir, output_dir, tag=tag)
         print("DeepSpeed conversion successful!")
     except Exception as e:
@@ -242,8 +223,6 @@ def consolidate_deepspeed_checkpoint(trainer, tokenizer, output_dir: str):
         traceback.print_exc()
         return
 
-    # Step 4b: If a leftover directory named 'pytorch_model.bin' exists (from an earlier buggy run),
-    # move the inner file out and remove the directory so that vLLM finds a proper file.
     pm_path = os.path.join(output_dir, "pytorch_model.bin")
     if os.path.isdir(pm_path):
         inner_pm = os.path.join(pm_path, "pytorch_model.bin")
@@ -264,9 +243,7 @@ def consolidate_deepspeed_checkpoint(trainer, tokenizer, output_dir: str):
         except Exception as fix_e:
             print(f"Warning: failed to fix directory 'pytorch_model.bin': {fix_e}")
 
-    # Step 5: Save the tokenizer and config files to the top-level output directory.
     print(f"Saving tokenizer and config to {output_dir}...")
-    # Ensure required files exist for vLLM/HF
     try:
         trainer.model.config.save_pretrained(output_dir)
     except Exception as e:
@@ -282,18 +259,15 @@ def consolidate_deepspeed_checkpoint(trainer, tokenizer, output_dir: str):
 
 
 # -------------------- Main --------------------
-# In train_qwen_think.py, replace the entire main() function with this.
-
 def main():
     check_environment()
 
     p = argparse.ArgumentParser(description="Fine-tune a Qwen model for competitive programming.")
-    
     # --- Core Paths ---
     p.add_argument("--model-name", default="Qwen/Qwen2.5-7B-Instruct")
     p.add_argument("--dataset-path", required=True)
     p.add_argument("--output-dir", required=True)
-    
+
     # --- Training Hyperparameters ---
     p.add_argument("--num-train-epochs", type=float, default=3.0)
     p.add_argument("--learning-rate", type=float, default=4e-5)
@@ -303,28 +277,35 @@ def main():
     # --- Batching and Sequence Length ---
     p.add_argument("--per-device-train-batch-size", type=int, default=1)
     p.add_argument("--gradient-accumulation-steps", type=int, default=8)
-    p.add_argument("--max-seq-length", type=int, default=16384) #TODO
+    p.add_argument("--max-seq-length", type=int, default=16384)
 
     # --- Checkpointing and Logging ---
     p.add_argument("--save-strategy", default="epoch", choices=["steps", "epoch"], help="Save checkpoints by 'epoch' or 'steps'.")
     p.add_argument("--save-steps", type=int, default=0, help="If saving by steps, the step interval. If saving by epoch, this is ignored.")
-    p.add_argument("--save-total-limit", type=int, default=50) #Erran TODO
+    p.add_argument("--save-total-limit", type=int, default=50)
     p.add_argument("--logging-steps", type=int, default=10)
-    
+
     # --- System and DeepSpeed ---
     p.add_argument("--deepspeed", type=str, default=None, help="Path to DeepSpeed config file.")
     p.add_argument("--bf16_full_eval", action="store_true", help="Enable full evaluation in bf16 to save memory.")
     p.add_argument("--report-to", default="wandb", choices=["wandb", "none"])
     p.add_argument("--wandb-project", default="new-ft-qwen2.5-mot", help="WandB project name.")
-    
+
     # --- Data Handling ---
     p.add_argument("--validation-split-percentage", type=int, default=5)
     p.add_argument("--max-train-samples", type=int, default=0, help="If set, subsample the training set.")
-    
-    # --- Resuming ---
+
+    # --- Weight decay / resume control ---
+    p.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay to pass into TrainingArguments (important).")
     p.add_argument("--resume-from-checkpoint", type=str, default=None, help="Path to checkpoint to resume from.")
+    p.add_argument("--force-fresh-start", action="store_true", help="If set ignore --resume-from-checkpoint and start fresh (useful when changing optimizer hyperparams).")
 
     args = p.parse_args()
+
+    # if user asked to force fresh start, ignore resume
+    if args.force_fresh_start and args.resume_from_checkpoint:
+        print(f"WARNING: --force-fresh-start set; ignoring resume-from-checkpoint {args.resume_from_checkpoint}")
+        args.resume_from_checkpoint = None
 
     # --- Setup ---
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
@@ -338,6 +319,15 @@ def main():
         validation_split_percentage=args.validation_split_percentage,
         max_samples=args.max_train_samples,
     )
+
+    # quick sanity print of tokenized samples (helpful for diffs)
+    try:
+        print("=== sample tokenized input ids (first 3 training examples) ===")
+        for i in range(min(3, len(train_dataset))):
+            s = train_dataset[i]
+            print(f"sample {i}: input_ids_len={len(s.get('input_ids',[]))} labels_len={len(s.get('labels',[]))}")
+    except Exception as e:
+        print("Warning: could not print tokenized samples:", e)
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
@@ -355,13 +345,14 @@ def main():
         save_steps_value = updates_per_epoch
         print(f"Save strategy is 'epoch', will save every {save_steps_value} steps.")
 
+    # --- Training arguments (note weight_decay passed) ---
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         deepspeed=args.deepspeed,
         bf16=True,
         bf16_full_eval=args.bf16_full_eval,
         do_train=True,
-        do_eval=False, # Keeping eval disabled for stability
+        do_eval=False,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         gradient_checkpointing=True,
@@ -372,11 +363,27 @@ def main():
         warmup_ratio=args.warmup_ratio,
         logging_steps=args.logging_steps,
         save_strategy=args.save_strategy,
-        save_steps=save_steps_value, # <-- BUG FIX: Use the calculated value
+        save_steps=save_steps_value,
         save_total_limit=args.save_total_limit,
         report_to=args.report_to,
         remove_unused_columns=False,
+        weight_decay=args.weight_decay,
     )
+
+    # debug print
+    print("=== TrainingArguments summary (selected) ===")
+    print("weight_decay:", training_args.weight_decay)
+    print("num_train_epochs:", training_args.num_train_epochs)
+    print("per_device_train_batch_size:", training_args.per_device_train_batch_size)
+    print("gradient_accumulation_steps:", training_args.gradient_accumulation_steps)
+    print("max_seq_length (tokenization):", args.max_seq_length)
+    if args.deepspeed and os.path.exists(args.deepspeed):
+        try:
+            with open(args.deepspeed, "r") as f:
+                ds_json = json.load(f)
+            print("DeepSpeed JSON (optimizer section if present):", ds_json.get("optimizer"))
+        except Exception as e:
+            print("Warning: could not read deepspeed json:", e)
 
     data_collator = DataCollatorForSeq2Seq(
         tokenizer, model=model, label_pad_token_id=-100, pad_to_multiple_of=8
@@ -390,11 +397,40 @@ def main():
         data_collator=data_collator,
     )
 
+    # Try to eagerly create optimizer so we can inspect param groups (may be no-op in some trainer variants)
+    try:
+        # Many Trainer implementations expose create_optimizer_and_scheduler
+        if hasattr(trainer, "create_optimizer_and_scheduler"):
+            trainer.create_optimizer_and_scheduler()
+        elif hasattr(trainer, "create_optimizer"):
+            trainer.create_optimizer()
+    except Exception as e:
+        print("Note: could not pre-create optimizer (Trainer may create it at train start):", e)
+
+    # Inspect optimizer param-groups
+    try:
+        optim = getattr(trainer, "optimizer", None)
+        if optim is None:
+            # sometimes the optimizer is stored under trainer.optimizer
+            optim = getattr(trainer, "_optimizer", None)
+        if optim is not None:
+            wds = list({float(pg.get("weight_decay", 0.0)) for pg in optim.param_groups})
+            print(">>> optimizer param-group weight_decay values:", wds)
+        else:
+            print(">>> trainer.optimizer is not available yet (will be created at train())")
+    except Exception as e:
+        print("Warning: failed to inspect optimizer param groups:", e)
+
+    # Warn about resume-from-checkpoint implications
+    if args.resume_from_checkpoint:
+        print(f"WARNING: Resuming from checkpoint: {args.resume_from_checkpoint}")
+        print("If the checkpoint contains optimizer state trained with a different weight_decay, the optimizer state may preserve that configuration.")
+        print("For a clean test of new weight_decay, re-run without --resume-from-checkpoint or use --force-fresh-start to ignore resume.")
+
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
-    
-    # IMPROVEMENT: Pass the model directly, as that's all the function needs.
+
     consolidate_deepspeed_checkpoint(trainer.model, tokenizer, args.output_dir)
+
 
 if __name__ == "__main__":
     main()
-
